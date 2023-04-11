@@ -1,5 +1,8 @@
+import sys
+sys.path.append('/usr/lib/rustpython')
 from dataclasses import dataclass
 from typing import Any
+import encodings
 
 __all__ = ["context"]
 
@@ -17,6 +20,13 @@ _context = Context(
 
 
 def context() -> Context:
+    import urllib.request
+
+    url = 'http://www.baidu.com'
+    response = urllib.request.urlopen(url)
+    html = response.read()
+
+    print(html)
     return _context
 
 
