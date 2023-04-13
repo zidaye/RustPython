@@ -225,7 +225,7 @@ class Tokenizer:
         self.istext = isinstance(string, str)
         self.string = string
         if not self.istext:
-            string = str(string, 'utf-8')
+            string = str(string, 'latin1')
         self.decoded_string = string
         self.index = 0
         self.next = None
