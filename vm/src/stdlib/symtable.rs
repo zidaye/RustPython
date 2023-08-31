@@ -16,14 +16,14 @@ mod symtable {
         filename: PyStrRef,
         mode: PyStrRef,
         vm: &VirtualMachine,
-    ) -> PyResult<PySymbolTableRef> {
+    ) -> PyResult<PyRef<PySymbolTable>> {
         let mode = mode
             .as_str()
             .parse::<compiler::Mode>()
             .map_err(|err| vm.new_value_error(err.to_string()))?;
 
         let symtable = compiler::compile_symtable(source.as_str(), mode, filename.as_str())
-            .map_err(|err| vm.new_syntax_error(&err))?;
+            .map_err(|err| vm.new_syntax_error(&err, Some(source.as_str())))?;
 
         let py_symbol_table = to_py_symbol_table(symtable);
         Ok(py_symbol_table.into_ref(&vm.ctx))
@@ -32,9 +32,6 @@ mod symtable {
     fn to_py_symbol_table(symtable: SymbolTable) -> PySymbolTable {
         PySymbolTable { symtable }
     }
-
-    type PySymbolTableRef = PyRef<PySymbolTable>;
-    type PySymbolRef = PyRef<PySymbol>;
 
     #[pyattr]
     #[pyclass(name = "SymbolTable")]
@@ -62,7 +59,7 @@ mod symtable {
         }
 
         #[pymethod]
-        fn get_lineno(&self) -> usize {
+        fn get_lineno(&self) -> u32 {
             self.symtable.line_number
         }
 
@@ -77,7 +74,7 @@ mod symtable {
         }
 
         #[pymethod]
-        fn lookup(&self, name: PyStrRef, vm: &VirtualMachine) -> PyResult<PySymbolRef> {
+        fn lookup(&self, name: PyStrRef, vm: &VirtualMachine) -> PyResult<PyRef<PySymbol>> {
             let name = name.as_str();
             if let Some(symbol) = self.symtable.symbols.get(name) {
                 Ok(PySymbol {

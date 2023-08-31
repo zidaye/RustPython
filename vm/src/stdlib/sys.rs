@@ -1,6 +1,6 @@
-use crate::{convert::ToPyObject, PyObject, PyResult, VirtualMachine};
+use crate::{builtins::PyModule, convert::ToPyObject, Py, PyResult, VirtualMachine};
 
-pub(crate) use sys::{UnraisableHookArgs, MAXSIZE, MULTIARCH};
+pub(crate) use sys::{UnraisableHookArgs, __module_def, DOC, MAXSIZE, MULTIARCH};
 
 #[pymodule]
 mod sys {
@@ -590,7 +590,14 @@ mod sys {
     fn unraisablehook(unraisable: UnraisableHookArgs, vm: &VirtualMachine) {
         if let Err(e) = _unraisablehook(unraisable, vm) {
             let stderr = super::PyStderr(vm);
-            writeln!(stderr, "{}", e.as_object().repr(vm).unwrap().as_str());
+            writeln!(
+                stderr,
+                "{}",
+                e.as_object()
+                    .repr(vm)
+                    .unwrap_or_else(|_| vm.ctx.empty_str.to_owned())
+                    .as_str()
+            );
         }
     }
 
@@ -607,6 +614,23 @@ mod sys {
     #[pyattr]
     fn int_info(vm: &VirtualMachine) -> PyTupleRef {
         PyIntInfo::INFO.into_struct_sequence(vm)
+    }
+
+    #[pyfunction]
+    fn get_int_max_str_digits(vm: &VirtualMachine) -> usize {
+        vm.state.int_max_str_digits.load()
+    }
+
+    #[pyfunction]
+    fn set_int_max_str_digits(maxdigits: usize, vm: &VirtualMachine) -> PyResult<()> {
+        let threshold = PyIntInfo::INFO.str_digits_check_threshold;
+        if maxdigits == 0 || maxdigits >= threshold {
+            vm.state.int_max_str_digits.store(maxdigits);
+            Ok(())
+        } else {
+            let error = format!("maxdigits must be 0 or larger than {:?}", threshold);
+            Err(vm.new_value_error(error))
+        }
     }
 
     #[pyfunction]
@@ -703,7 +727,7 @@ mod sys {
         /// -X utf8
         utf8_mode: u8,
         /// -X int_max_str_digits=number
-        int_max_str_digits: i8,
+        int_max_str_digits: i64,
         /// -P, `PYTHONSAFEPATH`
         safe_path: bool,
         /// -X warn_default_encoding, PYTHONWARNDEFAULTENCODING
@@ -729,8 +753,8 @@ mod sys {
                 isolated: settings.isolated as u8,
                 dev_mode: settings.dev_mode,
                 utf8_mode: settings.utf8_mode,
-                int_max_str_digits: -1,
-                safe_path: false,
+                int_max_str_digits: settings.int_max_str_digits,
+                safe_path: settings.safe_path,
                 warn_default_encoding: settings.warn_default_encoding as u8,
             }
         }
@@ -909,13 +933,15 @@ mod sys {
     impl UnraisableHookArgs {}
 }
 
-pub(crate) fn init_module(vm: &VirtualMachine, module: &PyObject, builtins: &PyObject) {
-    sys::extend_module(vm, module);
+pub(crate) fn init_module(vm: &VirtualMachine, module: &Py<PyModule>, builtins: &Py<PyModule>) {
+    sys::extend_module(vm, module).unwrap();
 
     let modules = vm.ctx.new_dict();
-    modules.set_item("sys", module.to_owned(), vm).unwrap();
     modules
-        .set_item("builtins", builtins.to_owned(), vm)
+        .set_item("sys", module.to_owned().into(), vm)
+        .unwrap();
+    modules
+        .set_item("builtins", builtins.to_owned().into(), vm)
         .unwrap();
     extend_module!(vm, module, {
         "__doc__" => sys::DOC.to_owned().to_pyobject(vm),

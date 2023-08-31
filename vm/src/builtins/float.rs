@@ -5,7 +5,6 @@ use super::{
 };
 use crate::{
     class::PyClassImpl,
-    common::format::FormatSpec,
     common::{float_ops, hash},
     convert::{IntoPyException, ToPyObject, ToPyResult},
     function::{
@@ -18,10 +17,11 @@ use crate::{
     AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult,
     TryFromBorrowedObject, TryFromObject, VirtualMachine,
 };
-use num_bigint::{BigInt, ToBigInt};
+use malachite_bigint::{BigInt, ToBigInt};
 use num_complex::Complex64;
-use num_rational::Ratio;
 use num_traits::{Signed, ToPrimitive, Zero};
+use rustpython_common::int::float_to_ratio;
+use rustpython_format::FormatSpec;
 
 #[pyclass(module = false, name = "float")]
 #[derive(Debug, Copy, Clone, PartialEq)]
@@ -30,7 +30,7 @@ pub struct PyFloat {
 }
 
 impl PyFloat {
-    pub fn to_f64(self) -> f64 {
+    pub fn to_f64(&self) -> f64 {
         self.value
     }
 }
@@ -178,7 +178,7 @@ fn float_from_string(val: PyObjectRef, vm: &VirtualMachine) -> PyResult<f64> {
             val.class().name()
         )));
     };
-    float_ops::parse_bytes(b).ok_or_else(|| {
+    crate::literal::float::parse_bytes(b).ok_or_else(|| {
         val.repr(vm)
             .map(|repr| vm.new_value_error(format!("could not convert string to float: {repr}")))
             .unwrap_or_else(|e| e)
@@ -452,31 +452,29 @@ impl PyFloat {
 
     #[pymethod]
     fn is_integer(&self) -> bool {
-        float_ops::is_integer(self.value)
+        crate::literal::float::is_integer(self.value)
     }
 
     #[pymethod]
     fn as_integer_ratio(&self, vm: &VirtualMachine) -> PyResult<(PyIntRef, PyIntRef)> {
         let value = self.value;
-        if !value.is_finite() {
-            return Err(if value.is_infinite() {
-                vm.new_overflow_error("cannot convert Infinity to integer ratio".to_owned())
-            } else if value.is_nan() {
-                vm.new_value_error("cannot convert NaN to integer ratio".to_owned())
-            } else {
-                unreachable!("it must be finite")
-            });
-        }
 
-        let ratio = Ratio::from_float(value).unwrap();
-        let numer = vm.ctx.new_bigint(ratio.numer());
-        let denom = vm.ctx.new_bigint(ratio.denom());
-        Ok((numer, denom))
+        float_to_ratio(value)
+            .map(|(numer, denom)| (vm.ctx.new_bigint(&numer), vm.ctx.new_bigint(&denom)))
+            .ok_or_else(|| {
+                if value.is_infinite() {
+                    vm.new_overflow_error("cannot convert Infinity to integer ratio".to_owned())
+                } else if value.is_nan() {
+                    vm.new_value_error("cannot convert NaN to integer ratio".to_owned())
+                } else {
+                    unreachable!("finite float must able to convert to integer ratio")
+                }
+            })
     }
 
     #[pyclassmethod]
     fn fromhex(cls: PyTypeRef, string: PyStrRef, vm: &VirtualMachine) -> PyResult {
-        let result = float_ops::from_hex(string.as_str().trim()).ok_or_else(|| {
+        let result = crate::literal::float::from_hex(string.as_str().trim()).ok_or_else(|| {
             vm.new_value_error("invalid hexadecimal floating-point string".to_owned())
         })?;
         PyType::call(&cls, vec![vm.ctx.new_float(result).into()].into(), vm)
@@ -484,7 +482,7 @@ impl PyFloat {
 
     #[pymethod]
     fn hex(&self) -> String {
-        float_ops::to_hex(self.value)
+        crate::literal::float::to_hex(self.value)
     }
 
     #[pymethod(magic)]
@@ -549,7 +547,15 @@ impl AsNumber for PyFloat {
             multiply: Some(|a, b, vm| PyFloat::number_op(a, b, |a, b, _vm| a * b, vm)),
             remainder: Some(|a, b, vm| PyFloat::number_op(a, b, inner_mod, vm)),
             divmod: Some(|a, b, vm| PyFloat::number_op(a, b, inner_divmod, vm)),
-            power: Some(|a, b, vm| PyFloat::number_op(a, b, float_pow, vm)),
+            power: Some(|a, b, c, vm| {
+                if vm.is_none(c) {
+                    PyFloat::number_op(a, b, float_pow, vm)
+                } else {
+                    Err(vm.new_type_error(String::from(
+                        "pow() 3rd argument not allowed unless all arguments are integers",
+                    )))
+                }
+            }),
             negative: Some(|num, vm| {
                 let value = PyFloat::number_downcast(num).value;
                 (-value).to_pyresult(vm)
@@ -562,9 +568,9 @@ impl AsNumber for PyFloat {
             boolean: Some(|num, _vm| Ok(PyFloat::number_downcast(num).value.is_zero())),
             int: Some(|num, vm| {
                 let value = PyFloat::number_downcast(num).value;
-                try_to_bigint(value, vm).map(|x| vm.ctx.new_int(x))
+                try_to_bigint(value, vm).map(|x| PyInt::from(x).into_pyobject(vm))
             }),
-            float: Some(|num, vm| Ok(PyFloat::number_downcast_exact(num, vm))),
+            float: Some(|num, vm| Ok(PyFloat::number_downcast_exact(num, vm).into())),
             floor_divide: Some(|a, b, vm| PyFloat::number_op(a, b, inner_floordiv, vm)),
             true_divide: Some(|a, b, vm| PyFloat::number_op(a, b, inner_div, vm)),
             ..PyNumberMethods::NOT_IMPLEMENTED
@@ -581,7 +587,7 @@ impl AsNumber for PyFloat {
 impl Representable for PyFloat {
     #[inline]
     fn repr_str(zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<String> {
-        Ok(float_ops::to_string(zelf.value))
+        Ok(crate::literal::float::to_string(zelf.value))
     }
 }
 

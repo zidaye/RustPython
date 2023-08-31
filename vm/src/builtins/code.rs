@@ -8,10 +8,13 @@ use crate::{
     bytecode::{self, AsBag, BorrowedConstant, CodeFlags, Constant, ConstantBag},
     class::{PyClassImpl, StaticType},
     convert::ToPyObject,
+    frozen,
     function::{FuncArgs, OptionalArg},
+    source_code::OneIndexed,
     types::Representable,
     AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyResult, VirtualMachine,
 };
+use malachite_bigint::BigInt;
 use num_traits::Zero;
 use std::{borrow::Borrow, fmt, ops::Deref};
 
@@ -149,7 +152,7 @@ impl ConstantBag for PyObjBag<'_> {
         self.0.intern_str(name)
     }
 
-    fn make_int(&self, value: num_bigint::BigInt) -> Self::Constant {
+    fn make_int(&self, value: BigInt) -> Self::Constant {
         Literal(self.0.new_int(value).into())
     }
 
@@ -180,7 +183,7 @@ impl IntoCodeObject for bytecode::CodeObject {
     }
 }
 
-impl<B: AsRef<[u8]>> IntoCodeObject for bytecode::frozen_lib::FrozenCodeObject<B> {
+impl<B: AsRef<[u8]>> IntoCodeObject for frozen::FrozenCodeObject<B> {
     fn into_code_object(self, ctx: &Context) -> CodeObject {
         self.decode(ctx)
     }
@@ -225,12 +228,12 @@ impl Representable for PyCode {
             code.obj_name,
             zelf.get_id(),
             code.source_path.as_str(),
-            code.first_line_number
+            code.first_line_number.map_or(-1, |n| n.get() as i32)
         ))
     }
 }
 
-#[pyclass(with(Py))]
+#[pyclass(with(Representable))]
 impl PyCode {
     #[pyslot]
     fn slot_new(_cls: PyTypeRef, _args: FuncArgs, vm: &VirtualMachine) -> PyResult {
@@ -275,8 +278,8 @@ impl PyCode {
     }
 
     #[pygetset]
-    fn co_firstlineno(&self) -> usize {
-        self.code.first_line_number as usize
+    fn co_firstlineno(&self) -> u32 {
+        self.code.first_line_number.map_or(0, |n| n.get())
     }
 
     #[pygetset]
@@ -348,7 +351,7 @@ impl PyCode {
         };
 
         let first_line_number = match args.co_firstlineno {
-            OptionalArg::Present(first_line_number) => first_line_number,
+            OptionalArg::Present(first_line_number) => OneIndexed::new(first_line_number),
             OptionalArg::Missing => self.code.first_line_number,
         };
 
@@ -415,21 +418,6 @@ impl PyCode {
                 cell2arg: self.code.cell2arg.clone(),
             },
         })
-    }
-}
-
-#[pyclass]
-impl Py<PyCode> {
-    #[pymethod(magic)]
-    fn repr(&self) -> String {
-        let code = &self.code;
-        format!(
-            "<code object {} at {:#x} file {:?}, line {}>",
-            code.obj_name,
-            self.get_id(),
-            code.source_path.as_str(),
-            code.first_line_number
-        )
     }
 }
 

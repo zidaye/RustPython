@@ -1,4 +1,6 @@
 import sys
+import os
+import subprocess
 
 from testutils import assert_raises
 
@@ -92,3 +94,36 @@ if sys.platform.startswith("win"):
     # assert winver.major == winver.platform_version[0]
     # assert winver.minor == winver.platform_version[1]
     # assert winver.build == winver.platform_version[2]
+
+# test int_max_str_digits getter and setter
+
+assert sys.get_int_max_str_digits() == 4300
+sys.set_int_max_str_digits(640)
+assert sys.get_int_max_str_digits() == 640
+sys.set_int_max_str_digits(0)
+assert sys.get_int_max_str_digits() == 0
+
+with assert_raises(ValueError):
+    sys.set_int_max_str_digits(1)
+
+sys.set_int_max_str_digits(1000)
+assert sys.get_int_max_str_digits() == 1000
+
+# Test the PYTHONSAFEPATH environment variable
+code = "import sys; print(sys.flags.safe_path)"
+env = dict(os.environ)
+env.pop('PYTHONSAFEPATH', None)
+args = (sys.executable, '-P', '-c', code)
+
+proc = subprocess.run(
+    args, stdout=subprocess.PIPE,
+    universal_newlines=True, env=env)
+assert proc.stdout.rstrip() == 'True', proc
+assert proc.returncode == 0, proc
+
+env['PYTHONSAFEPATH'] = '1'
+proc = subprocess.run(
+    args, stdout=subprocess.PIPE,
+    universal_newlines=True, env=env)
+assert proc.stdout.rstrip() == 'True'
+assert proc.returncode == 0, proc

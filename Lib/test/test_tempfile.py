@@ -465,6 +465,7 @@ class TestMkstempInner(TestBadTempdir, BaseTestCase):
             expected = user * (1 + 8 + 64)
         self.assertEqual(mode, expected)
 
+    @support.requires_fork()
     @unittest.skipUnless(has_spawnl, 'os.spawnl not available')
     def test_noinherit(self):
         # _mkstemp_inner file handles are not inherited by child processes

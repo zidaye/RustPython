@@ -1,10 +1,8 @@
-use core::fmt;
-use std::convert::Infallible;
-
-use num_bigint::{BigInt, Sign};
+use crate::bytecode::*;
+use malachite_bigint::{BigInt, Sign};
 use num_complex::Complex64;
-
-use crate::{bytecode::*, Location};
+use rustpython_parser_core::source_code::{OneIndexed, SourceLocation};
+use std::convert::Infallible;
 
 pub const FORMAT_VERSION: u32 = 4;
 
@@ -16,16 +14,19 @@ pub enum MarshalError {
     InvalidBytecode,
     /// Invalid utf8 in string
     InvalidUtf8,
+    /// Invalid source location
+    InvalidLocation,
     /// Bad type marker
     BadType,
 }
 
-impl fmt::Display for MarshalError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+impl std::fmt::Display for MarshalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::Eof => f.write_str("unexpected end of data"),
             Self::InvalidBytecode => f.write_str("invalid bytecode"),
             Self::InvalidUtf8 => f.write_str("invalid utf8"),
+            Self::InvalidLocation => f.write_str("invalid source location"),
             Self::BadType => f.write_str("bad type marker"),
         }
     }
@@ -183,12 +184,12 @@ pub fn deserialize_code<R: Read, Bag: ConstantBag>(
     let len = rdr.read_u32()?;
     let locations = (0..len)
         .map(|_| {
-            Ok(Location {
-                row: rdr.read_u32()?,
-                column: rdr.read_u32()?,
+            Ok(SourceLocation {
+                row: OneIndexed::new(rdr.read_u32()?).ok_or(MarshalError::InvalidLocation)?,
+                column: OneIndexed::from_zero_indexed(rdr.read_u32()?),
             })
         })
-        .collect::<Result<Box<[Location]>>>()?;
+        .collect::<Result<Box<[SourceLocation]>>>()?;
 
     let flags = CodeFlags::from_bits_truncate(rdr.read_u16()?);
 
@@ -199,7 +200,7 @@ pub fn deserialize_code<R: Read, Bag: ConstantBag>(
     let len = rdr.read_u32()?;
     let source_path = bag.make_name(rdr.read_str(len)?);
 
-    let first_line_number = rdr.read_u32()?;
+    let first_line_number = OneIndexed::new(rdr.read_u32()?);
     let max_stackdepth = rdr.read_u32()?;
 
     let len = rdr.read_u32()?;
@@ -483,7 +484,9 @@ impl Write for Vec<u8> {
 }
 
 pub(crate) fn write_len<W: Write>(buf: &mut W, len: usize) {
-    let Ok(len) = len.try_into() else { panic!("too long to serialize") };
+    let Ok(len) = len.try_into() else {
+        panic!("too long to serialize")
+    };
     buf.write_u32(len);
 }
 
@@ -586,8 +589,8 @@ pub fn serialize_code<W: Write, C: Constant>(buf: &mut W, code: &CodeObject<C>) 
 
     write_len(buf, code.locations.len());
     for loc in &*code.locations {
-        buf.write_u32(loc.row);
-        buf.write_u32(loc.column);
+        buf.write_u32(loc.row.get());
+        buf.write_u32(loc.column.to_zero_indexed());
     }
 
     buf.write_u16(code.flags.bits());
@@ -598,7 +601,7 @@ pub fn serialize_code<W: Write, C: Constant>(buf: &mut W, code: &CodeObject<C>) 
 
     write_vec(buf, code.source_path.as_ref().as_bytes());
 
-    buf.write_u32(code.first_line_number);
+    buf.write_u32(code.first_line_number.map_or(0, |x| x.get()));
     buf.write_u32(code.max_stackdepth);
 
     write_vec(buf, code.obj_name.as_ref().as_bytes());

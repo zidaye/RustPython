@@ -7,20 +7,18 @@ use crate::{
     anystr::{self, adjust_indices, AnyStr, AnyStrContainer, AnyStrWrapper},
     atomic_func,
     class::PyClassImpl,
-    common::{
-        format::{FormatSpec, FormatString, FromTemplate},
-        str::{BorrowedStr, PyStrKind, PyStrKindData},
-    },
+    common::str::{BorrowedStr, PyStrKind, PyStrKindData},
     convert::{IntoPyException, ToPyException, ToPyObject, ToPyResult},
     format::{format, format_map},
     function::{ArgIterable, ArgSize, FuncArgs, OptionalArg, OptionalOption, PyComparisonValue},
     intern::PyInterned,
+    object::{Traverse, TraverseFn},
     protocol::{PyIterReturn, PyMappingMethods, PyNumberMethods, PySequenceMethods},
     sequence::SequenceExt,
     sliceable::{SequenceIndex, SliceableSequenceOp},
     types::{
-        AsMapping, AsNumber, AsSequence, Comparable, Constructor, Hashable, IterNext,
-        IterNextIterable, Iterable, PyComparisonOp, Representable, Unconstructible,
+        AsMapping, AsNumber, AsSequence, Comparable, Constructor, Hashable, IterNext, Iterable,
+        PyComparisonOp, Representable, SelfIter, Unconstructible,
     },
     AsObject, Context, Py, PyExact, PyObject, PyObjectRef, PyPayload, PyRef, PyRefExact, PyResult,
     TryFromBorrowedObject, VirtualMachine,
@@ -36,6 +34,7 @@ use rustpython_common::{
     hash,
     lock::PyMutex,
 };
+use rustpython_format::{FormatSpec, FormatString, FromTemplate};
 use std::{char, fmt, ops::Range, string::ToString};
 use unic_ucd_bidi::BidiClass;
 use unic_ucd_category::GeneralCategory;
@@ -186,10 +185,17 @@ impl<'a> AsPyStr<'a> for &'a PyStrInterned {
     }
 }
 
-#[pyclass(module = false, name = "str_iterator")]
+#[pyclass(module = false, name = "str_iterator", traverse = "manual")]
 #[derive(Debug)]
 pub struct PyStrIterator {
     internal: PyMutex<(PositionIterInternal<PyStrRef>, usize)>,
+}
+
+unsafe impl Traverse for PyStrIterator {
+    fn traverse(&self, tracer: &mut TraverseFn) {
+        // No need to worry about deadlock, for inner is a PyStr and can't make ref cycle
+        self.internal.lock().0.traverse(tracer);
+    }
 }
 
 impl PyPayload for PyStrIterator {
@@ -198,7 +204,7 @@ impl PyPayload for PyStrIterator {
     }
 }
 
-#[pyclass(with(Constructor, IterNext))]
+#[pyclass(with(Constructor, IterNext, Iterable))]
 impl PyStrIterator {
     #[pymethod(magic)]
     fn length_hint(&self) -> usize {
@@ -224,7 +230,7 @@ impl PyStrIterator {
 }
 impl Unconstructible for PyStrIterator {}
 
-impl IterNextIterable for PyStrIterator {}
+impl SelfIter for PyStrIterator {}
 impl IterNext for PyStrIterator {
     fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         let mut internal = zelf.internal.lock();
@@ -310,8 +316,9 @@ impl PyStr {
         Self::new_str_unchecked(bytes, PyStrKind::Ascii)
     }
 
-    pub fn new_ref(s: impl Into<Self>, ctx: &Context) -> PyRef<Self> {
-        PyRef::new_ref(s.into(), ctx.types.str_type.to_owned(), None)
+    pub fn new_ref(zelf: impl Into<Self>, ctx: &Context) -> PyRef<Self> {
+        let zelf = zelf.into();
+        PyRef::new_ref(zelf, ctx.types.str_type.to_owned(), None)
     }
 
     fn new_substr(&self, s: String) -> Self {
@@ -352,7 +359,7 @@ impl PyStr {
         if value == 0 && zelf.class().is(vm.ctx.types.str_type) {
             // Special case: when some `str` is multiplied by `0`,
             // returns the empty `str`.
-            return Ok(vm.ctx.empty_str.clone());
+            return Ok(vm.ctx.empty_str.to_owned());
         }
         if (value == 1 || zelf.is_empty()) && zelf.class().is(vm.ctx.types.str_type) {
             // Special case: when some `str` is multiplied by `1` or is the empty `str`,
@@ -491,9 +498,12 @@ impl PyStr {
 
     #[inline]
     pub(crate) fn repr(&self, vm: &VirtualMachine) -> PyResult<String> {
-        rustpython_common::str::repr(self.as_str())
-            .to_string_checked()
-            .map_err(|err| vm.new_overflow_error(err.to_string()))
+        use crate::literal::escape::UnicodeEscape;
+        let escape = UnicodeEscape::new_repr(self.as_str());
+        escape
+            .str_repr()
+            .to_string()
+            .ok_or_else(|| vm.new_overflow_error("string is too long to generate repr".to_owned()))
     }
 
     #[pymethod]
@@ -852,7 +862,7 @@ impl PyStr {
     ///   * Zs (Separator, Space) other than ASCII space('\x20').
     #[pymethod]
     fn isprintable(&self) -> bool {
-        self.char_all(|c| c == '\u{0020}' || rustpython_common::char::is_printable(c))
+        self.char_all(|c| c == '\u{0020}' || rustpython_literal::char::is_printable(c))
     }
 
     #[pymethod]

@@ -1,10 +1,11 @@
 use crate::{
-    builtins::{PyBaseExceptionRef, PySet},
+    builtins::{PyBaseExceptionRef, PyModule, PySet},
     common::crt_fd::Fd,
     convert::IntoPyException,
     function::{ArgumentError, FromArgs, FsPath, FuncArgs},
-    AsObject, PyObject, PyObjectRef, PyPayload, PyResult, TryFromObject, VirtualMachine,
+    AsObject, Py, PyObjectRef, PyPayload, PyResult, TryFromObject, VirtualMachine,
 };
+
 use std::{
     ffi, fs, io,
     path::{Path, PathBuf},
@@ -54,8 +55,9 @@ pub struct OsPath {
 
 impl OsPath {
     pub fn new_str(path: impl Into<ffi::OsString>) -> Self {
+        let path = path.into();
         Self {
-            path: path.into(),
+            path,
             mode: OutputMode::String,
         }
     }
@@ -178,11 +180,13 @@ impl IOErrorBuilder {
         }
     }
     pub(crate) fn filename(mut self, filename: impl Into<OsPathOrFd>) -> Self {
-        self.filename.replace(filename.into());
+        let filename = filename.into();
+        self.filename.replace(filename);
         self
     }
     pub(crate) fn filename2(mut self, filename: impl Into<OsPathOrFd>) -> Self {
-        self.filename2.replace(filename.into());
+        let filename = filename.into();
+        self.filename2.replace(filename);
         self
     }
 }
@@ -296,28 +300,26 @@ fn bytes_as_osstr<'a>(b: &'a [u8], vm: &VirtualMachine) -> PyResult<&'a ffi::OsS
         .map_err(|_| vm.new_unicode_decode_error("can't decode path for utf-8".to_owned()))
 }
 
-#[pymodule(name = "_os")]
+#[pymodule(sub)]
 pub(super) mod _os {
     use super::{
         errno_err, DirFd, FollowSymlinks, IOErrorBuilder, OsPath, OsPathOrFd, OutputMode,
         SupportFunc,
     };
-    use crate::common::lock::{OnceCell, PyRwLock};
     use crate::{
         builtins::{
             PyBytesRef, PyGenericAlias, PyIntRef, PyStrRef, PyTuple, PyTupleRef, PyTypeRef,
         },
-        common::{
-            crt_fd::{Fd, Offset},
-            suppress_iph,
-        },
+        common::crt_fd::{Fd, Offset},
+        common::lock::{OnceCell, PyRwLock},
+        common::suppress_iph,
         convert::{IntoPyException, ToPyObject},
         function::{ArgBytesLike, Either, FsPath, FuncArgs, OptionalArg},
         protocol::PyIterReturn,
         recursion::ReprGuard,
-        types::{IterNext, IterNextIterable, PyStructSequence},
+        types::{IterNext, Iterable, PyStructSequence, Representable, SelfIter},
         vm::VirtualMachine,
-        AsObject, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject,
+        AsObject, Py, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject,
     };
     use crossbeam_utils::atomic::AtomicCell;
     use itertools::Itertools;
@@ -619,7 +621,7 @@ pub(super) mod _os {
         ino: AtomicCell<Option<u64>>,
     }
 
-    #[pyclass]
+    #[pyclass(with(Representable))]
     impl DirEntry {
         #[pygetset]
         fn name(&self, vm: &VirtualMachine) -> PyResult {
@@ -747,9 +749,16 @@ pub(super) mod _os {
             self.path(vm)
         }
 
-        #[pymethod(magic)]
-        fn repr(zelf: PyObjectRef, vm: &VirtualMachine) -> PyResult<String> {
-            let name = match zelf.get_attr("name", vm) {
+        #[pyclassmethod(magic)]
+        fn class_getitem(cls: PyTypeRef, args: PyObjectRef, vm: &VirtualMachine) -> PyGenericAlias {
+            PyGenericAlias::new(cls, args, vm)
+        }
+    }
+
+    impl Representable for DirEntry {
+        #[inline]
+        fn repr_str(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<String> {
+            let name = match zelf.as_object().get_attr("name", vm) {
                 Ok(name) => Some(name),
                 Err(e)
                     if e.fast_isinstance(vm.ctx.exceptions.attribute_error)
@@ -760,7 +769,7 @@ pub(super) mod _os {
                 Err(e) => return Err(e),
             };
             if let Some(name) = name {
-                if let Some(_guard) = ReprGuard::enter(vm, &zelf) {
+                if let Some(_guard) = ReprGuard::enter(vm, zelf.as_object()) {
                     let repr = name.repr(vm)?;
                     Ok(format!("<{} {}>", zelf.class(), repr))
                 } else {
@@ -773,11 +782,6 @@ pub(super) mod _os {
                 Ok(format!("<{}>", zelf.class()))
             }
         }
-
-        #[pyclassmethod(magic)]
-        fn class_getitem(cls: PyTypeRef, args: PyObjectRef, vm: &VirtualMachine) -> PyGenericAlias {
-            PyGenericAlias::new(cls, args, vm)
-        }
     }
 
     #[pyattr]
@@ -788,7 +792,7 @@ pub(super) mod _os {
         mode: OutputMode,
     }
 
-    #[pyclass(with(IterNext))]
+    #[pyclass(with(IterNext, Iterable))]
     impl ScandirIterator {
         #[pymethod]
         fn close(&self) {
@@ -806,7 +810,7 @@ pub(super) mod _os {
             zelf.close()
         }
     }
-    impl IterNextIterable for ScandirIterator {}
+    impl SelfIter for ScandirIterator {}
     impl IterNext for ScandirIterator {
         fn next(zelf: &crate::Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
             let entryref: &mut Option<fs::ReadDir> = &mut zelf.entries.write();
@@ -1167,7 +1171,7 @@ pub(super) mod _os {
     }
 
     #[pyfunction]
-    fn exit(code: i32) {
+    fn _exit(code: i32) {
         std::process::exit(code)
     }
 
@@ -1706,9 +1710,7 @@ impl SupportFunc {
     }
 }
 
-pub fn extend_module(vm: &VirtualMachine, module: &PyObject) {
-    _os::extend_module(vm, module);
-
+pub fn extend_module(vm: &VirtualMachine, module: &Py<PyModule>) {
     let support_funcs = _os::support_funcs();
     let supports_fd = PySet::default().into_ref(&vm.ctx);
     let supports_dir_fd = PySet::default().into_ref(&vm.ctx);

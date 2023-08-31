@@ -4,15 +4,16 @@ use crate::{
     class::PyClassImpl,
     function::{ArgIntoBool, OptionalArg, PosArgs},
     protocol::{PyIter, PyIterReturn},
-    types::{Constructor, IterNext, IterNextIterable},
+    types::{Constructor, IterNext, Iterable, SelfIter},
     AsObject, Context, Py, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject, VirtualMachine,
 };
 use rustpython_common::atomic::{self, PyAtomic, Radium};
 
-#[pyclass(module = false, name = "zip")]
+#[pyclass(module = false, name = "zip", traverse)]
 #[derive(Debug)]
 pub struct PyZip {
     iterators: Vec<PyIter>,
+    #[pytraverse(skip)]
     strict: PyAtomic<bool>,
 }
 
@@ -40,7 +41,7 @@ impl Constructor for PyZip {
     }
 }
 
-#[pyclass(with(IterNext, Constructor), flags(BASETYPE))]
+#[pyclass(with(IterNext, Iterable, Constructor), flags(BASETYPE))]
 impl PyZip {
     #[pymethod(magic)]
     fn reduce(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult<PyTupleRef> {
@@ -67,7 +68,7 @@ impl PyZip {
     }
 }
 
-impl IterNextIterable for PyZip {}
+impl SelfIter for PyZip {}
 impl IterNext for PyZip {
     fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         if zelf.iterators.is_empty() {

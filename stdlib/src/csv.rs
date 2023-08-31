@@ -8,7 +8,7 @@ mod _csv {
         function::{ArgIterable, ArgumentError, FromArgs, FuncArgs},
         match_class,
         protocol::{PyIter, PyIterReturn},
-        types::{IterNext, IterNextIterable},
+        types::{IterNext, Iterable, SelfIter},
         AsObject, Py, PyObjectRef, PyPayload, PyResult, TryFromObject, VirtualMachine,
     };
     use itertools::{self, Itertools};
@@ -152,10 +152,11 @@ mod _csv {
         reader: csv_core::Reader,
     }
 
-    #[pyclass(no_attr, module = "_csv", name = "reader")]
+    #[pyclass(no_attr, module = "_csv", name = "reader", traverse)]
     #[derive(PyPayload)]
     pub(super) struct Reader {
         iter: PyIter,
+        #[pytraverse(skip)]
         state: PyMutex<ReadState>,
     }
 
@@ -165,9 +166,9 @@ mod _csv {
         }
     }
 
-    #[pyclass(with(IterNext))]
+    #[pyclass(with(IterNext, Iterable))]
     impl Reader {}
-    impl IterNextIterable for Reader {}
+    impl SelfIter for Reader {}
     impl IterNext for Reader {
         fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
             let string = match zelf.iter.next(vm)? {
@@ -242,10 +243,11 @@ mod _csv {
         writer: csv_core::Writer,
     }
 
-    #[pyclass(no_attr, module = "_csv", name = "writer")]
+    #[pyclass(no_attr, module = "_csv", name = "writer", traverse)]
     #[derive(PyPayload)]
     pub(super) struct Writer {
         write: PyObjectRef,
+        #[pytraverse(skip)]
         state: PyMutex<WriteState>,
     }
 

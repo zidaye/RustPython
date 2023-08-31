@@ -2,11 +2,11 @@ use super::{PyType, PyTypeRef};
 use crate::{
     class::PyClassImpl,
     protocol::{PyIter, PyIterReturn},
-    types::{Constructor, IterNext, IterNextIterable},
+    types::{Constructor, IterNext, Iterable, SelfIter},
     Context, Py, PyObjectRef, PyPayload, PyResult, VirtualMachine,
 };
 
-#[pyclass(module = false, name = "filter")]
+#[pyclass(module = false, name = "filter", traverse)]
 #[derive(Debug)]
 pub struct PyFilter {
     predicate: PyObjectRef,
@@ -32,7 +32,7 @@ impl Constructor for PyFilter {
     }
 }
 
-#[pyclass(with(IterNext, Constructor), flags(BASETYPE))]
+#[pyclass(with(IterNext, Iterable, Constructor), flags(BASETYPE))]
 impl PyFilter {
     #[pymethod(magic)]
     fn reduce(&self, vm: &VirtualMachine) -> (PyTypeRef, (PyObjectRef, PyIter)) {
@@ -43,7 +43,7 @@ impl PyFilter {
     }
 }
 
-impl IterNextIterable for PyFilter {}
+impl SelfIter for PyFilter {}
 impl IterNext for PyFilter {
     fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         let predicate = &zelf.predicate;

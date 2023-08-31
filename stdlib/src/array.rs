@@ -1,8 +1,8 @@
 // spell-checker:ignore typecode tofile tolist fromfile
 
-use rustpython_vm::{PyObjectRef, VirtualMachine};
+use rustpython_vm::{builtins::PyModule, PyRef, VirtualMachine};
 
-pub(crate) fn make_module(vm: &VirtualMachine) -> PyObjectRef {
+pub(crate) fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
     let module = array::make_module(vm);
 
     let array = module
@@ -61,8 +61,8 @@ mod array {
                 SliceableSequenceOp,
             },
             types::{
-                AsBuffer, AsMapping, AsSequence, Comparable, Constructor, IterNext,
-                IterNextIterable, Iterable, PyComparisonOp,
+                AsBuffer, AsMapping, AsSequence, Comparable, Constructor, IterNext, Iterable,
+                PyComparisonOp, Representable, SelfIter,
             },
             AsObject, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
         },
@@ -721,7 +721,15 @@ mod array {
 
     #[pyclass(
         flags(BASETYPE),
-        with(Comparable, AsBuffer, AsMapping, AsSequence, Iterable, Constructor)
+        with(
+            Comparable,
+            AsBuffer,
+            AsMapping,
+            AsSequence,
+            Iterable,
+            Constructor,
+            Representable
+        )
     )]
     impl PyArray {
         fn read(&self) -> PyRwLockReadGuard<'_, ArrayContentType> {
@@ -1114,23 +1122,6 @@ mod array {
         }
 
         #[pymethod(magic)]
-        fn repr(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<String> {
-            let class = zelf.class();
-            let class_name = class.name();
-            if zelf.read().typecode() == 'u' {
-                if zelf.len() == 0 {
-                    return Ok(format!("{class_name}('u')"));
-                }
-                return Ok(format!(
-                    "{}('u', {})",
-                    class_name,
-                    crate::common::str::repr(&zelf.tounicode(vm)?)
-                ));
-            }
-            zelf.read().repr(&class_name, vm)
-        }
-
-        #[pymethod(magic)]
         pub(crate) fn len(&self) -> usize {
             self.read().len()
         }
@@ -1292,6 +1283,23 @@ mod array {
         }
     }
 
+    impl Representable for PyArray {
+        #[inline]
+        fn repr_str(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<String> {
+            let class = zelf.class();
+            let class_name = class.name();
+            if zelf.read().typecode() == 'u' {
+                if zelf.len() == 0 {
+                    return Ok(format!("{class_name}('u')"));
+                }
+                let to_unicode = zelf.tounicode(vm)?;
+                let escape = crate::vm::literal::escape::UnicodeEscape::new_repr(&to_unicode);
+                return Ok(format!("{}('u', {})", class_name, escape.str_repr()));
+            }
+            zelf.read().repr(&class_name, vm)
+        }
+    }
+
     static BUFFER_METHODS: BufferMethods = BufferMethods {
         obj_bytes: |buffer| buffer.obj_as::<PyArray>().get_bytes().into(),
         obj_bytes_mut: |buffer| buffer.obj_as::<PyArray>().get_bytes_mut().into(),
@@ -1389,13 +1397,13 @@ mod array {
     }
 
     #[pyattr]
-    #[pyclass(name = "arrayiterator")]
+    #[pyclass(name = "arrayiterator", traverse)]
     #[derive(Debug, PyPayload)]
     pub struct PyArrayIter {
         internal: PyMutex<PositionIterInternal<PyArrayRef>>,
     }
 
-    #[pyclass(with(IterNext), flags(HAS_DICT))]
+    #[pyclass(with(IterNext, Iterable), flags(HAS_DICT))]
     impl PyArrayIter {
         #[pymethod(magic)]
         fn setstate(&self, state: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
@@ -1412,7 +1420,7 @@ mod array {
         }
     }
 
-    impl IterNextIterable for PyArrayIter {}
+    impl SelfIter for PyArrayIter {}
     impl IterNext for PyArrayIter {
         fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
             zelf.internal.lock().next(|array, pos| {
@@ -1476,14 +1484,14 @@ mod array {
                 _ => false,
             };
             match code {
-                0 | 1 => Ok(Self::Int8 { signed }),
-                2 | 3 | 4 | 5 => Ok(Self::Int16 { signed, big_endian }),
-                6 | 7 | 8 | 9 => Ok(Self::Int32 { signed, big_endian }),
-                10 | 11 | 12 | 13 => Ok(Self::Int64 { signed, big_endian }),
-                14 | 15 => Ok(Self::Ieee754Float { big_endian }),
-                16 | 17 => Ok(Self::Ieee754Double { big_endian }),
-                18 | 19 => Ok(Self::Utf16 { big_endian }),
-                20 | 21 => Ok(Self::Utf32 { big_endian }),
+                0..=1 => Ok(Self::Int8 { signed }),
+                2..=5 => Ok(Self::Int16 { signed, big_endian }),
+                6..=9 => Ok(Self::Int32 { signed, big_endian }),
+                10..=13 => Ok(Self::Int64 { signed, big_endian }),
+                14..=15 => Ok(Self::Ieee754Float { big_endian }),
+                16..=17 => Ok(Self::Ieee754Double { big_endian }),
+                18..=19 => Ok(Self::Utf16 { big_endian }),
+                20..=21 => Ok(Self::Utf32 { big_endian }),
                 _ => Err(code),
             }
         }

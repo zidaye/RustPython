@@ -8,11 +8,13 @@ repository = "https://github.com/RustPython/RustPython"
 license = "MIT"
 
 [dependencies]
+rustpython-parser-core = { workspace = true }
+
 bitflags = { workspace = true }
-bstr = { workspace = true }
 itertools = { workspace = true }
-num-bigint = { workspace = true }
+malachite-bigint = { workspace = true }
 num-complex = { workspace = true }
 serde = { version = "1.0.133", optional = true, default-features = false, features = ["derive"] }
 
 lz4_flex = "0.9.2"
+

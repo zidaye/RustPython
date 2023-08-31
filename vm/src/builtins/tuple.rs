@@ -1,5 +1,6 @@
 use super::{PositionIterInternal, PyGenericAlias, PyStrRef, PyType, PyTypeRef};
 use crate::common::{hash::PyHash, lock::PyMutex};
+use crate::object::{Traverse, TraverseFn};
 use crate::{
     atomic_func,
     class::PyClassImpl,
@@ -11,8 +12,8 @@ use crate::{
     sequence::{OptionalRangeArgs, SequenceExt},
     sliceable::{SequenceIndex, SliceableSequenceOp},
     types::{
-        AsMapping, AsSequence, Comparable, Constructor, Hashable, IterNext, IterNextIterable,
-        Iterable, PyComparisonOp, Representable, Unconstructible,
+        AsMapping, AsSequence, Comparable, Constructor, Hashable, IterNext, Iterable,
+        PyComparisonOp, Representable, SelfIter, Unconstructible,
     },
     utils::collection_repr,
     vm::VirtualMachine,
@@ -21,7 +22,7 @@ use crate::{
 use once_cell::sync::Lazy;
 use std::{fmt, marker::PhantomData};
 
-#[pyclass(module = false, name = "tuple")]
+#[pyclass(module = false, name = "tuple", traverse)]
 pub struct PyTuple {
     elements: Box<[PyObjectRef]>,
 }
@@ -421,7 +422,7 @@ impl Representable for PyTuple {
     }
 }
 
-#[pyclass(module = false, name = "tuple_iterator")]
+#[pyclass(module = false, name = "tuple_iterator", traverse)]
 #[derive(Debug)]
 pub(crate) struct PyTupleIterator {
     internal: PyMutex<PositionIterInternal<PyTupleRef>>,
@@ -433,7 +434,7 @@ impl PyPayload for PyTupleIterator {
     }
 }
 
-#[pyclass(with(Constructor, IterNext))]
+#[pyclass(with(Constructor, IterNext, Iterable))]
 impl PyTupleIterator {
     #[pymethod(magic)]
     fn length_hint(&self) -> usize {
@@ -456,7 +457,7 @@ impl PyTupleIterator {
 }
 impl Unconstructible for PyTupleIterator {}
 
-impl IterNextIterable for PyTupleIterator {}
+impl SelfIter for PyTupleIterator {}
 impl IterNext for PyTupleIterator {
     fn next(zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         zelf.internal.lock().next(|tuple, pos| {
@@ -477,6 +478,15 @@ pub struct PyTupleTyped<T: TransmuteFromObject> {
     //                   elements must be logically valid when transmuted to T
     tuple: PyTupleRef,
     _marker: PhantomData<Vec<T>>,
+}
+
+unsafe impl<T> Traverse for PyTupleTyped<T>
+where
+    T: TransmuteFromObject + Traverse,
+{
+    fn traverse(&self, tracer_fn: &mut TraverseFn) {
+        self.tuple.traverse(tracer_fn);
+    }
 }
 
 impl<T: TransmuteFromObject> TryFromObject for PyTupleTyped<T> {

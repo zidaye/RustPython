@@ -4,9 +4,8 @@ use crate::{
     bytesinner::PyBytesInner,
     class::PyClassImpl,
     common::{
-        format::FormatSpec,
         hash,
-        int::{bigint_to_finite_float, bytes_to_int},
+        int::{bigint_to_finite_float, bytes_to_int, true_div},
     },
     convert::{IntoPyException, ToPyObject, ToPyResult},
     function::{
@@ -18,12 +17,12 @@ use crate::{
     AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyRefExact, PyResult,
     TryFromBorrowedObject, VirtualMachine,
 };
-use num_bigint::{BigInt, Sign};
+use malachite_bigint::{BigInt, Sign};
 use num_integer::Integer;
-use num_rational::Ratio;
 use num_traits::{One, Pow, PrimInt, Signed, ToPrimitive, Zero};
-use std::ops::{Div, Neg};
-use std::{fmt, ops::Not};
+use rustpython_format::FormatSpec;
+use std::fmt;
+use std::ops::{Neg, Not};
 
 #[pyclass(module = false, name = "int")]
 #[derive(Debug)]
@@ -197,7 +196,7 @@ fn inner_truediv(i1: &BigInt, i2: &BigInt, vm: &VirtualMachine) -> PyResult {
         return Err(vm.new_zero_division_error("division by zero".to_owned()));
     }
 
-    let float = Ratio::from(i1.clone()).div(i2).to_f64().unwrap();
+    let float = true_div(i1, i2);
 
     if float.is_infinite() {
         Err(vm.new_exception_msg(
@@ -277,7 +276,7 @@ impl PyInt {
                     out = out.wrapping_shl(32) | digit;
                 }
                 match v.sign() {
-                    num_bigint::Sign::Minus => out * -1i32 as u32,
+                    Sign::Minus => out * -1i32 as u32,
                     _ => out,
                 }
             })
@@ -745,7 +744,24 @@ impl PyInt {
         multiply: Some(|a, b, vm| PyInt::number_op(a, b, |a, b, _vm| a * b, vm)),
         remainder: Some(|a, b, vm| PyInt::number_op(a, b, inner_mod, vm)),
         divmod: Some(|a, b, vm| PyInt::number_op(a, b, inner_divmod, vm)),
-        power: Some(|a, b, vm| PyInt::number_op(a, b, inner_pow, vm)),
+        power: Some(|a, b, c, vm| {
+            if let (Some(a), Some(b)) = (
+                a.payload::<Self>(),
+                if b.payload_is::<Self>() {
+                    Some(b)
+                } else {
+                    None
+                },
+            ) {
+                if vm.is_none(c) {
+                    a.general_op(b.to_owned(), |a, b| inner_pow(a, b, vm), vm)
+                } else {
+                    a.modpow(b.to_owned(), c.to_owned(), vm)
+                }
+            } else {
+                Ok(vm.ctx.not_implemented())
+            }
+        }),
         negative: Some(|num, vm| (&PyInt::number_downcast(num).value).neg().to_pyresult(vm)),
         positive: Some(|num, vm| Ok(PyInt::number_downcast_exact(num, vm).into())),
         absolute: Some(|num, vm| PyInt::number_downcast(num).value.abs().to_pyresult(vm)),
@@ -756,14 +772,14 @@ impl PyInt {
         and: Some(|a, b, vm| PyInt::number_op(a, b, |a, b, _vm| a & b, vm)),
         xor: Some(|a, b, vm| PyInt::number_op(a, b, |a, b, _vm| a ^ b, vm)),
         or: Some(|a, b, vm| PyInt::number_op(a, b, |a, b, _vm| a | b, vm)),
-        int: Some(|num, vm| Ok(PyInt::number_downcast_exact(num, vm))),
+        int: Some(|num, vm| Ok(PyInt::number_downcast_exact(num, vm).into())),
         float: Some(|num, vm| {
             let zelf = PyInt::number_downcast(num);
-            try_to_float(&zelf.value, vm).map(|x| vm.ctx.new_float(x))
+            try_to_float(&zelf.value, vm).map(|x| vm.ctx.new_float(x).into())
         }),
         floor_divide: Some(|a, b, vm| PyInt::number_op(a, b, inner_floordiv, vm)),
         true_divide: Some(|a, b, vm| PyInt::number_op(a, b, inner_truediv, vm)),
-        index: Some(|num, vm| Ok(PyInt::number_downcast_exact(num, vm))),
+        index: Some(|num, vm| Ok(PyInt::number_downcast_exact(num, vm).into())),
         ..PyNumberMethods::NOT_IMPLEMENTED
     };
 

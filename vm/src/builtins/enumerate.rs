@@ -7,15 +7,16 @@ use crate::{
     convert::ToPyObject,
     function::OptionalArg,
     protocol::{PyIter, PyIterReturn},
-    types::{Constructor, IterNext, IterNextIterable},
+    types::{Constructor, IterNext, Iterable, SelfIter},
     AsObject, Context, Py, PyObjectRef, PyPayload, PyResult, VirtualMachine,
 };
-use num_bigint::BigInt;
+use malachite_bigint::BigInt;
 use num_traits::Zero;
 
-#[pyclass(module = false, name = "enumerate")]
+#[pyclass(module = false, name = "enumerate", traverse)]
 #[derive(Debug)]
 pub struct PyEnumerate {
+    #[pytraverse(skip)]
     counter: PyRwLock<BigInt>,
     iterator: PyIter,
 }
@@ -51,7 +52,7 @@ impl Constructor for PyEnumerate {
     }
 }
 
-#[pyclass(with(Py, IterNext, Constructor), flags(BASETYPE))]
+#[pyclass(with(Py, IterNext, Iterable, Constructor), flags(BASETYPE))]
 impl PyEnumerate {
     #[pyclassmethod(magic)]
     fn class_getitem(cls: PyTypeRef, args: PyObjectRef, vm: &VirtualMachine) -> PyGenericAlias {
@@ -70,7 +71,7 @@ impl Py<PyEnumerate> {
     }
 }
 
-impl IterNextIterable for PyEnumerate {}
+impl SelfIter for PyEnumerate {}
 impl IterNext for PyEnumerate {
     fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         let next_obj = match zelf.iterator.next(vm)? {
@@ -84,7 +85,7 @@ impl IterNext for PyEnumerate {
     }
 }
 
-#[pyclass(module = false, name = "reversed")]
+#[pyclass(module = false, name = "reversed", traverse)]
 #[derive(Debug)]
 pub struct PyReverseSequenceIterator {
     internal: PyMutex<PositionIterInternal<PyObjectRef>>,
@@ -96,7 +97,7 @@ impl PyPayload for PyReverseSequenceIterator {
     }
 }
 
-#[pyclass(with(IterNext))]
+#[pyclass(with(IterNext, Iterable))]
 impl PyReverseSequenceIterator {
     pub fn new(obj: PyObjectRef, len: usize) -> Self {
         let position = len.saturating_sub(1);
@@ -129,7 +130,7 @@ impl PyReverseSequenceIterator {
     }
 }
 
-impl IterNextIterable for PyReverseSequenceIterator {}
+impl SelfIter for PyReverseSequenceIterator {}
 impl IterNext for PyReverseSequenceIterator {
     fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         zelf.internal

@@ -1,11 +1,11 @@
 use crate::{
-    builtins::{
-        type_::PointerSlot, PyFloat, PyInt, PyStr, PyStrInterned, PyStrRef, PyType, PyTypeRef,
-    },
+    builtins::{type_::PointerSlot, PyInt, PyStr, PyStrInterned, PyStrRef, PyType, PyTypeRef},
     bytecode::ComparisonOperator,
     common::hash::PyHash,
     convert::{ToPyObject, ToPyResult},
-    function::{Either, FromArgs, FuncArgs, OptionalArg, PyComparisonValue, PySetterValue},
+    function::{
+        Either, FromArgs, FuncArgs, OptionalArg, PyComparisonValue, PyMethodDef, PySetterValue,
+    },
     identifier,
     protocol::{
         PyBuffer, PyIterReturn, PyMapping, PyMappingMethods, PyNumber, PyNumberMethods,
@@ -64,6 +64,8 @@ pub struct PyTypeSlots {
     pub iter: AtomicCell<Option<IterFunc>>,
     pub iternext: AtomicCell<Option<IterNextFunc>>,
 
+    pub methods: &'static [PyMethodDef],
+
     // Flags to define presence of optional/expanded features
     pub flags: PyTypeFlags,
 
@@ -100,6 +102,13 @@ impl PyTypeSlots {
             ..Default::default()
         }
     }
+
+    pub fn heap_default() -> Self {
+        Self {
+            // init: AtomicCell::new(Some(init_wrapper)),
+            ..Default::default()
+        }
+    }
 }
 
 impl std::fmt::Debug for PyTypeSlots {
@@ -109,12 +118,13 @@ impl std::fmt::Debug for PyTypeSlots {
 }
 
 bitflags! {
+    #[derive(Copy, Clone, Debug, PartialEq)]
     #[non_exhaustive]
     pub struct PyTypeFlags: u64 {
         const IMMUTABLETYPE = 1 << 8;
         const HEAPTYPE = 1 << 9;
         const BASETYPE = 1 << 10;
-        const METHOD_DESCR = 1 << 17;
+        const METHOD_DESCRIPTOR = 1 << 17;
         const HAS_DICT = 1 << 40;
 
         #[cfg(debug_assertions)]
@@ -131,10 +141,10 @@ impl PyTypeFlags {
     /// Used for types created in Python. Subclassable and are a
     /// heaptype.
     pub const fn heap_type_flags() -> Self {
-        unsafe {
-            Self::from_bits_unchecked(
-                Self::DEFAULT.bits | Self::HEAPTYPE.bits | Self::BASETYPE.bits,
-            )
+        match Self::from_bits(Self::DEFAULT.bits() | Self::HEAPTYPE.bits() | Self::BASETYPE.bits())
+        {
+            Some(flags) => flags,
+            None => unreachable!(),
         }
     }
 
@@ -197,30 +207,11 @@ pub(crate) fn len_wrapper(obj: &PyObject, vm: &VirtualMachine) -> PyResult<usize
     Ok(len as usize)
 }
 
-fn int_wrapper(num: PyNumber, vm: &VirtualMachine) -> PyResult<PyRef<PyInt>> {
-    let ret = vm.call_special_method(num.deref(), identifier!(vm, __int__), ())?;
-    ret.downcast::<PyInt>().map_err(|obj| {
-        vm.new_type_error(format!("__int__ returned non-int (type {})", obj.class()))
-    })
+macro_rules! number_unary_op_wrapper {
+    ($name:ident) => {
+        |a, vm| vm.call_special_method(a.deref(), identifier!(vm, $name), ())
+    };
 }
-
-fn index_wrapper(num: PyNumber, vm: &VirtualMachine) -> PyResult<PyRef<PyInt>> {
-    let ret = vm.call_special_method(num.deref(), identifier!(vm, __index__), ())?;
-    ret.downcast::<PyInt>().map_err(|obj| {
-        vm.new_type_error(format!("__index__ returned non-int (type {})", obj.class()))
-    })
-}
-
-fn float_wrapper(num: PyNumber, vm: &VirtualMachine) -> PyResult<PyRef<PyFloat>> {
-    let ret = vm.call_special_method(num.deref(), identifier!(vm, __float__), ())?;
-    ret.downcast::<PyFloat>().map_err(|obj| {
-        vm.new_type_error(format!(
-            "__float__ returned non-float (type {})",
-            obj.class()
-        ))
-    })
-}
-
 macro_rules! number_binary_op_wrapper {
     ($name:ident) => {
         |a, b, vm| vm.call_special_method(a, identifier!(vm, $name), (b.to_owned(),))
@@ -231,7 +222,6 @@ macro_rules! number_binary_right_op_wrapper {
         |a, b, vm| vm.call_special_method(b, identifier!(vm, $name), (a.to_owned(),))
     };
 }
-
 fn getitem_wrapper<K: ToPyObject>(obj: &PyObject, needle: K, vm: &VirtualMachine) -> PyResult {
     vm.call_special_method(obj, identifier!(vm, __getitem__), (needle,))
 }
@@ -320,6 +310,11 @@ fn iter_wrapper(zelf: PyObjectRef, vm: &VirtualMachine) -> PyResult {
     vm.call_special_method(&zelf, identifier!(vm, __iter__), ())
 }
 
+// PyObject_SelfIter in CPython
+fn self_iter(zelf: PyObjectRef, _vm: &VirtualMachine) -> PyResult {
+    Ok(zelf)
+}
+
 fn iternext_wrapper(zelf: &PyObject, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
     PyIterReturn::from_pyresult(
         vm.call_special_method(zelf, identifier!(vm, __next__), ()),
@@ -359,7 +354,7 @@ fn init_wrapper(obj: PyObjectRef, args: FuncArgs, vm: &VirtualMachine) -> PyResu
     Ok(())
 }
 
-fn new_wrapper(cls: PyTypeRef, mut args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+pub(crate) fn new_wrapper(cls: PyTypeRef, mut args: FuncArgs, vm: &VirtualMachine) -> PyResult {
     let new = cls.get_attr(identifier!(vm, __new__)).unwrap();
     args.prepend_arg(cls.into());
     new.call(args, vm)
@@ -505,13 +500,13 @@ impl PyType {
                 toggle_slot!(del, del_wrapper);
             }
             _ if name == identifier!(ctx, __int__) => {
-                toggle_subslot!(as_number, int, int_wrapper);
+                toggle_subslot!(as_number, int, number_unary_op_wrapper!(__int__));
             }
             _ if name == identifier!(ctx, __index__) => {
-                toggle_subslot!(as_number, index, index_wrapper);
+                toggle_subslot!(as_number, index, number_unary_op_wrapper!(__index__));
             }
             _ if name == identifier!(ctx, __float__) => {
-                toggle_subslot!(as_number, float, float_wrapper);
+                toggle_subslot!(as_number, float, number_unary_op_wrapper!(__float__));
             }
             _ if name == identifier!(ctx, __add__) => {
                 toggle_subslot!(as_number, add, number_binary_op_wrapper!(__add__));
@@ -588,21 +583,29 @@ impl PyType {
                 );
             }
             _ if name == identifier!(ctx, __pow__) => {
-                toggle_subslot!(as_number, power, number_binary_op_wrapper!(__pow__));
+                toggle_subslot!(as_number, power, |a, b, c, vm| {
+                    let args = if vm.is_none(c) {
+                        vec![b.to_owned()]
+                    } else {
+                        vec![b.to_owned(), c.to_owned()]
+                    };
+                    vm.call_special_method(a, identifier!(vm, __pow__), args)
+                });
             }
             _ if name == identifier!(ctx, __rpow__) => {
-                toggle_subslot!(
-                    as_number,
-                    right_power,
-                    number_binary_right_op_wrapper!(__rpow__)
-                );
+                toggle_subslot!(as_number, right_power, |a, b, c, vm| {
+                    let args = if vm.is_none(c) {
+                        vec![a.to_owned()]
+                    } else {
+                        vec![a.to_owned(), c.to_owned()]
+                    };
+                    vm.call_special_method(b, identifier!(vm, __rpow__), args)
+                });
             }
             _ if name == identifier!(ctx, __ipow__) => {
-                toggle_subslot!(
-                    as_number,
-                    inplace_power,
-                    number_binary_op_wrapper!(__ipow__)
-                );
+                toggle_subslot!(as_number, inplace_power, |a, b, _, vm| {
+                    vm.call_special_method(a, identifier!(vm, __ipow__), (b.to_owned(),))
+                });
             }
             _ if name == identifier!(ctx, __lshift__) => {
                 toggle_subslot!(as_number, lshift, number_binary_op_wrapper!(__lshift__));
@@ -829,10 +832,17 @@ pub trait Callable: PyPayload {
     #[inline]
     #[pyslot]
     fn slot_call(zelf: &PyObject, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
-        let zelf = zelf
-            .downcast_ref()
-            .ok_or_else(|| vm.new_type_error("unexpected payload for __call__".to_owned()))?;
-        Self::call(zelf, args.bind(vm)?, vm)
+        let zelf = zelf.downcast_ref().ok_or_else(|| {
+            let repr = zelf.repr(vm);
+            let help = if let Ok(repr) = repr.as_ref() {
+                repr.as_str().to_owned()
+            } else {
+                zelf.class().name().to_owned()
+            };
+            vm.new_type_error(format!("unexpected payload for __call__ of {help}"))
+        })?;
+        let args = args.bind(vm)?;
+        Self::call(zelf, args, vm)
     }
 
     #[inline]
@@ -1234,7 +1244,6 @@ pub trait AsNumber: PyPayload {
 #[pyclass]
 pub trait Iterable: PyPayload {
     #[pyslot]
-    #[pymethod(name = "__iter__")]
     fn slot_iter(zelf: PyObjectRef, vm: &VirtualMachine) -> PyResult {
         let zelf = zelf
             .downcast()
@@ -1242,7 +1251,14 @@ pub trait Iterable: PyPayload {
         Self::iter(zelf, vm)
     }
 
+    #[pymethod]
+    fn __iter__(zelf: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        Self::slot_iter(zelf, vm)
+    }
+
     fn iter(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult;
+
+    fn extend_slots(_slots: &mut PyTypeSlots) {}
 }
 
 // `Iterator` fits better, but to avoid confusion with rust std::iter::Iterator
@@ -1265,19 +1281,29 @@ pub trait IterNext: PyPayload + Iterable {
     }
 }
 
-pub trait IterNextIterable: PyPayload {}
+pub trait SelfIter: PyPayload {}
 
 impl<T> Iterable for T
 where
-    T: IterNextIterable,
+    T: SelfIter,
 {
-    #[inline]
-    fn slot_iter(zelf: PyObjectRef, _vm: &VirtualMachine) -> PyResult {
-        Ok(zelf)
+    #[cold]
+    fn slot_iter(zelf: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        let repr = zelf.repr(vm)?;
+        unreachable!("slot must be overriden for {}", repr.as_str());
+    }
+
+    fn __iter__(zelf: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+        self_iter(zelf, vm)
     }
 
     #[cold]
     fn iter(_zelf: PyRef<Self>, _vm: &VirtualMachine) -> PyResult {
         unreachable!("slot_iter is implemented");
+    }
+
+    fn extend_slots(slots: &mut PyTypeSlots) {
+        let prev = slots.iter.swap(Some(self_iter));
+        debug_assert!(prev.is_some()); // slot_iter would be set
     }
 }

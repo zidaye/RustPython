@@ -16,8 +16,8 @@ use crate::{
     recursion::ReprGuard,
     types::AsNumber,
     types::{
-        AsSequence, Comparable, Constructor, Hashable, Initializer, IterNext, IterNextIterable,
-        Iterable, PyComparisonOp, Representable, Unconstructible,
+        AsSequence, Comparable, Constructor, Hashable, Initializer, IterNext, Iterable,
+        PyComparisonOp, Representable, SelfIter, Unconstructible,
     },
     utils::collection_repr,
     vm::VirtualMachine,
@@ -28,7 +28,7 @@ use std::{fmt, ops::Deref};
 
 pub type SetContentType = dictdatatype::Dict<()>;
 
-#[pyclass(module = false, name = "set", unhashable = true)]
+#[pyclass(module = false, name = "set", unhashable = true, traverse)]
 #[derive(Default)]
 pub struct PySet {
     pub(super) inner: PySetInner,
@@ -149,6 +149,13 @@ impl PyPayload for PyFrozenSet {
 #[derive(Default, Clone)]
 pub(super) struct PySetInner {
     content: PyRc<SetContentType>,
+}
+
+unsafe impl crate::object::Traverse for PySetInner {
+    fn traverse(&self, tracer_fn: &mut crate::object::TraverseFn) {
+        // FIXME(discord9): Rc means shared ref, so should it be traced?
+        self.content.traverse(tracer_fn)
+    }
 }
 
 impl PySetInner {
@@ -1225,7 +1232,7 @@ impl PyPayload for PySetIterator {
     }
 }
 
-#[pyclass(with(Constructor, IterNext))]
+#[pyclass(with(Constructor, IterNext, Iterable))]
 impl PySetIterator {
     #[pymethod(magic)]
     fn length_hint(&self) -> usize {
@@ -1250,7 +1257,7 @@ impl PySetIterator {
 }
 impl Unconstructible for PySetIterator {}
 
-impl IterNextIterable for PySetIterator {}
+impl SelfIter for PySetIterator {}
 impl IterNext for PySetIterator {
     fn next(zelf: &crate::Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         let mut internal = zelf.internal.lock();

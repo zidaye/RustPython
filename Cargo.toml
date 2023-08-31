@@ -12,17 +12,39 @@ include = ["LICENSE", "Cargo.toml", "src/**/*.rs"]
 [workspace]
 resolver = "2"
 members = [
-    "compiler", "compiler/ast", "compiler/core", "compiler/codegen", "compiler/parser",
+    "compiler", "compiler/core", "compiler/codegen",
     ".", "common", "derive", "jit", "vm", "pylib", "stdlib", "wasm/lib", "derive-impl",
 ]
 
 [workspace.dependencies]
+rustpython-compiler-core = { path = "compiler/core" }
+rustpython-compiler = { path = "compiler" }
+rustpython-codegen = { path = "compiler/codegen" }
+rustpython-common = { path = "common" }
+rustpython-derive = { path = "derive" }
+rustpython-derive-impl = { path = "derive-impl" }
+rustpython-jit = { path = "jit" }
+rustpython-vm = { path = "vm" }
+rustpython-pylib = { path = "pylib" }
+rustpython-stdlib = { path = "stdlib" }
+rustpython-doc = { git = "https://github.com/RustPython/__doc__", branch = "main" }
+
+rustpython-literal = { git = "https://github.com/RustPython/Parser.git", rev = "704eb40108239a8faf9bd1d4217e8dad0ac7edb3" }
+rustpython-parser-core = { git = "https://github.com/RustPython/Parser.git", rev = "704eb40108239a8faf9bd1d4217e8dad0ac7edb3" }
+rustpython-parser = { git = "https://github.com/RustPython/Parser.git", rev = "704eb40108239a8faf9bd1d4217e8dad0ac7edb3" }
+rustpython-ast = { git = "https://github.com/RustPython/Parser.git", rev = "704eb40108239a8faf9bd1d4217e8dad0ac7edb3" }
+rustpython-format = { git = "https://github.com/RustPython/Parser.git", rev = "704eb40108239a8faf9bd1d4217e8dad0ac7edb3" }
+# rustpython-literal = { path = "../RustPython-parser/literal" }
+# rustpython-parser-core = { path = "../RustPython-parser/core" }
+# rustpython-parser = { path = "../RustPython-parser/parser" }
+# rustpython-ast = { path = "../RustPython-parser/ast" }
+# rustpython-format = { path = "../RustPython-parser/format" }
+
 ahash = "0.7.6"
 anyhow = "1.0.45"
 ascii = "1.0"
 atty = "0.2.14"
-bincode = "1.3.3"
-bitflags = "1.3.2"
+bitflags = "2.2.1"
 bstr = "0.2.17"
 cfg-if = "1.0"
 chrono = "0.4.19"
@@ -36,10 +58,11 @@ itertools = "0.10.3"
 libc = "0.2.133"
 log = "0.4.16"
 nix = "0.26"
+malachite-bigint = { version = "0.1.0" }
+malachite-q = "0.3.2"
+malachite-base = "0.3.2"
 num-complex = "0.4.0"
-num-bigint = "0.4.3"
 num-integer = "0.1.44"
-num-rational = "0.4.0"
 num-traits = "0.2"
 num_enum = "0.5.7"
 once_cell = "1.13"
@@ -57,7 +80,7 @@ unicode_names2 = { version = "0.6.0", git = "https://ghproxy.com/https://github.
 widestring = "0.5.1"
 
 [features]
-default = ["threading", "stdlib", "zlib", "importlib", "encodings", "rustpython-parser/lalrpop"]
+default = ["threading", "stdlib", "zlib", "importlib", "encodings"]
 importlib = ["rustpython-vm/importlib"]
 encodings = ["rustpython-vm/encodings"]
 stdlib = ["rustpython-stdlib", "rustpython-pylib"]
@@ -72,10 +95,11 @@ ssl-vendor = ["rustpython-stdlib/ssl-vendor"]
 
 [dependencies]
 rustpython-compiler = { path = "compiler", version = "0.2.0" }
-rustpython-parser = { path = "compiler/parser", version = "0.2.0" }
 rustpython-pylib = { path = "pylib", optional = true, default-features = false }
 rustpython-stdlib = { path = "stdlib", optional = true, default-features = false }
 rustpython-vm = { path = "vm", version = "0.2.0", default-features = false, features = ["compiler"] }
+
+rustpython-parser = { workspace = true }
 
 atty = { workspace = true }
 cfg-if = { workspace = true }

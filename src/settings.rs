@@ -101,6 +101,11 @@ fn parse_arguments<'a>(app: App<'a, '_>) -> ArgMatches<'a> {
                 .help("don't write .pyc files on import"),
         )
         .arg(
+            Arg::with_name("safe-path")
+                .short("P")
+                .help("don’t prepend a potentially unsafe path to sys.path"),
+        )
+        .arg(
             Arg::with_name("ignore-environment")
                 .short("E")
                 .help("Ignore environment variables PYTHON* such as PYTHONPATH"),
@@ -227,6 +232,21 @@ fn settings_from(matches: &ArgMatches) -> (Settings, RunMode) {
     {
         settings.dont_write_bytecode = true;
     }
+    if !ignore_environment && env::var_os("PYTHONINTMAXSTRDIGITS").is_some() {
+        settings.int_max_str_digits = match env::var("PYTHONINTMAXSTRDIGITS").unwrap().parse() {
+            Ok(digits) if digits == 0 || digits >= 640 => digits,
+            _ => {
+                error!("Fatal Python error: config_init_int_max_str_digits: PYTHONINTMAXSTRDIGITS: invalid limit; must be >= 640 or 0 for unlimited.\nPython runtime state: preinitialized");
+                std::process::exit(1);
+            }
+        };
+    }
+
+    if matches.is_present("safe-path")
+        || (!ignore_environment && env::var_os("PYTHONSAFEPATH").is_some())
+    {
+        settings.safe_path = true;
+    }
 
     settings.check_hash_based_pycs = matches
         .value_of("check-hash-based-pycs")
@@ -239,6 +259,7 @@ fn settings_from(matches: &ArgMatches) -> (Settings, RunMode) {
         settings.xopts.extend(xopts.map(|s| {
             let mut parts = s.splitn(2, '=');
             let name = parts.next().unwrap().to_owned();
+            let value = parts.next().map(ToOwned::to_owned);
             if name == "dev" {
                 dev_mode = true
             }
@@ -248,7 +269,16 @@ fn settings_from(matches: &ArgMatches) -> (Settings, RunMode) {
             if name == "no_sig_int" {
                 settings.no_sig_int = true;
             }
-            let value = parts.next().map(ToOwned::to_owned);
+            if name == "int_max_str_digits" {
+                settings.int_max_str_digits = match value.as_ref().unwrap().parse() {
+                    Ok(digits) if digits == 0 || digits >= 640 => digits,
+                    _ => {
+
+                    error!("Fatal Python error: config_init_int_max_str_digits: -X int_max_str_digits: invalid limit; must be >= 640 or 0 for unlimited.\nPython runtime state: preinitialized");
+                    std::process::exit(1);
+                    },
+                };
+            }
             (name, value)
         }));
     }

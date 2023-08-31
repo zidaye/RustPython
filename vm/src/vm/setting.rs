@@ -37,11 +37,17 @@ pub struct Settings {
     /// -B
     pub dont_write_bytecode: bool,
 
+    /// -P
+    pub safe_path: bool,
+
     /// -b
     pub bytes_warning: u64,
 
     /// -Xfoo[=bar]
     pub xopts: Vec<(String, Option<String>)>,
+
+    /// -X int_max_str_digits
+    pub int_max_str_digits: i64,
 
     /// -I
     pub isolated: bool,
@@ -82,6 +88,13 @@ pub struct Settings {
     pub profile_format: Option<String>,
 }
 
+impl Settings {
+    pub fn with_path(mut self, path: String) -> Self {
+        self.path_list.push(path);
+        self
+    }
+}
+
 /// Sensible default settings.
 impl Default for Settings {
     fn default() -> Self {
@@ -97,6 +110,7 @@ impl Default for Settings {
             verbose: 0,
             quiet: false,
             dont_write_bytecode: false,
+            safe_path: false,
             bytes_warning: 0,
             xopts: vec![],
             isolated: false,
@@ -110,6 +124,7 @@ impl Default for Settings {
             check_hash_based_pycs: "default".to_owned(),
             allow_external_library: cfg!(feature = "importlib"),
             utf8_mode: 1,
+            int_max_str_digits: -1,
             #[cfg(feature = "flame-it")]
             profile_output: None,
             #[cfg(feature = "flame-it")]

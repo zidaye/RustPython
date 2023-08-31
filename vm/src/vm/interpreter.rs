@@ -14,10 +14,12 @@ use std::sync::atomic::Ordering;
 /// use rustpython_vm::compiler::Mode;
 /// Interpreter::without_stdlib(Default::default()).enter(|vm| {
 ///     let scope = vm.new_scope_with_builtins();
-///     let code_obj = vm.compile(r#"print("Hello World!")"#,
+///     let source = r#"print("Hello World!")"#;
+///     let code_obj = vm.compile(
+///             source,
 ///             Mode::Exec,
 ///             "<embedded>".to_owned(),
-///     ).map_err(|err| vm.new_syntax_error(&err)).unwrap();
+///     ).map_err(|err| vm.new_syntax_error(&err, Some(source))).unwrap();
 ///     vm.run_code_obj(code_obj, scope).unwrap();
 /// });
 /// ```
@@ -26,7 +28,10 @@ pub struct Interpreter {
 }
 
 impl Interpreter {
-    /// To create with stdlib, use `with_init`
+    /// This is a bare unit to build up an interpreter without the standard library.
+    /// To create an interpreter with the standard library with the `rustpython` crate, use `rustpython::InterpreterConfig`.
+    /// To create an interpreter without the `rustpython` crate, but only with `rustpython-vm`,
+    /// try to build one from the source code of `InterpreterConfig`. It will not be a one-liner but it also will not be too hard.
     pub fn without_stdlib(settings: Settings) -> Self {
         Self::with_init(settings, |_| {})
     }
@@ -46,6 +51,8 @@ impl Interpreter {
         F: FnOnce(&mut VirtualMachine),
     {
         let ctx = Context::genesis();
+        crate::types::TypeZoo::extend(ctx);
+        crate::exceptions::ExceptionZoo::extend(ctx);
         let mut vm = VirtualMachine::new(settings, ctx.clone());
         init(&mut vm);
         vm.initialize();
@@ -100,7 +107,7 @@ mod tests {
         builtins::{int, PyStr},
         PyObjectRef,
     };
-    use num_bigint::ToBigInt;
+    use malachite_bigint::ToBigInt;
 
     #[test]
     fn test_add_py_integers() {

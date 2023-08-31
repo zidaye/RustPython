@@ -33,7 +33,11 @@ impl PyMethod {
         let cls_attr = match interned_name.and_then(|name| cls.get_attr(name)) {
             Some(descr) => {
                 let descr_cls = descr.class();
-                let descr_get = if descr_cls.slots.flags.has_feature(PyTypeFlags::METHOD_DESCR) {
+                let descr_get = if descr_cls
+                    .slots
+                    .flags
+                    .has_feature(PyTypeFlags::METHOD_DESCRIPTOR)
+                {
                     is_method = true;
                     None
                 } else {
@@ -85,13 +89,18 @@ impl PyMethod {
         }
     }
 
-    pub(crate) fn get_special(
+    pub(crate) fn get_special<const DIRECT: bool>(
         obj: &PyObject,
         name: &'static PyStrInterned,
         vm: &VirtualMachine,
     ) -> PyResult<Option<Self>> {
         let obj_cls = obj.class();
-        let func = match obj_cls.get_attr(name) {
+        let attr = if DIRECT {
+            obj_cls.get_direct_attr(name)
+        } else {
+            obj_cls.get_attr(name)
+        };
+        let func = match attr {
             Some(f) => f,
             None => {
                 return Ok(None);
@@ -101,7 +110,7 @@ impl PyMethod {
             .class()
             .slots
             .flags
-            .has_feature(PyTypeFlags::METHOD_DESCR)
+            .has_feature(PyTypeFlags::METHOD_DESCRIPTOR)
         {
             Self::Function {
                 target: obj.to_owned(),

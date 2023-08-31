@@ -21,8 +21,8 @@ use crate::{
     },
     sliceable::SequenceIndexOp,
     types::{
-        AsBuffer, AsMapping, AsSequence, Comparable, Constructor, Hashable, IterNext,
-        IterNextIterable, Iterable, PyComparisonOp, Representable, Unconstructible,
+        AsBuffer, AsMapping, AsSequence, Comparable, Constructor, Hashable, IterNext, Iterable,
+        PyComparisonOp, Representable, SelfIter, Unconstructible,
     },
     AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult,
     TryFromBorrowedObject, TryFromObject, VirtualMachine,
@@ -1126,7 +1126,7 @@ impl Iterable for PyMemoryView {
 }
 
 #[pyclass(module = false, name = "memory_iterator")]
-#[derive(Debug)]
+#[derive(Debug, Traverse)]
 pub struct PyMemoryViewIterator {
     internal: PyMutex<PositionIterInternal<PyRef<PyMemoryView>>>,
 }
@@ -1137,7 +1137,7 @@ impl PyPayload for PyMemoryViewIterator {
     }
 }
 
-#[pyclass(with(Constructor, IterNext))]
+#[pyclass(with(Constructor, IterNext, Iterable))]
 impl PyMemoryViewIterator {
     #[pymethod(magic)]
     fn reduce(&self, vm: &VirtualMachine) -> PyTupleRef {
@@ -1148,7 +1148,7 @@ impl PyMemoryViewIterator {
 }
 impl Unconstructible for PyMemoryViewIterator {}
 
-impl IterNextIterable for PyMemoryViewIterator {}
+impl SelfIter for PyMemoryViewIterator {}
 impl IterNext for PyMemoryViewIterator {
     fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         zelf.internal.lock().next(|mv, pos| {

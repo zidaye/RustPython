@@ -7,15 +7,11 @@ pub use macros::*;
 pub mod atomic;
 pub mod borrow;
 pub mod boxvec;
-pub mod bytes;
-pub mod cformat;
-pub mod char;
 pub mod cmp;
 #[cfg(any(unix, windows, target_os = "wasi"))]
 pub mod crt_fd;
 pub mod encodings;
 pub mod float_ops;
-pub mod format;
 pub mod hash;
 pub mod int;
 pub mod linked_list;

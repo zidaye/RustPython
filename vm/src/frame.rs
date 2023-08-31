@@ -14,16 +14,16 @@ use crate::{
     function::{ArgMapping, Either, FuncArgs},
     protocol::{PyIter, PyIterReturn},
     scope::Scope,
+    source_code::SourceLocation,
     stdlib::builtins,
     vm::{Context, PyMethod},
     AsObject, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject, VirtualMachine,
 };
 use indexmap::IndexMap;
 use itertools::Itertools;
-use std::fmt;
-use std::iter::zip;
 #[cfg(feature = "threading")]
 use std::sync::atomic;
+use std::{fmt, iter::zip};
 
 #[derive(Clone, Debug)]
 struct Block {
@@ -165,7 +165,7 @@ impl Frame {
         }
     }
 
-    pub fn current_location(&self) -> bytecode::Location {
+    pub fn current_location(&self) -> SourceLocation {
         self.code.locations[self.lasti() as usize - 1]
     }
 
@@ -376,12 +376,8 @@ impl ExecutingFrame<'_> {
 
                         let loc = frame.code.locations[idx];
                         let next = exception.traceback();
-                        let new_traceback = PyTraceback::new(
-                            next,
-                            frame.object.to_owned(),
-                            frame.lasti(),
-                            loc.row(),
-                        );
+                        let new_traceback =
+                            PyTraceback::new(next, frame.object.to_owned(), frame.lasti(), loc.row);
                         vm_trace!("Adding to traceback: {:?} {:?}", new_traceback, loc.row());
                         exception.set_traceback(Some(new_traceback.into_ref(&vm.ctx)));
 
@@ -611,7 +607,18 @@ impl ExecutingFrame<'_> {
                 Ok(None)
             }
             bytecode::Instruction::DeleteFast(idx) => {
-                self.fastlocals.lock()[idx.get(arg) as usize] = None;
+                let mut fastlocals = self.fastlocals.lock();
+                let idx = idx.get(arg) as usize;
+                if fastlocals[idx].is_none() {
+                    return Err(vm.new_exception_msg(
+                        vm.ctx.exceptions.unbound_local_error.to_owned(),
+                        format!(
+                            "local variable '{}' referenced before assignment",
+                            self.code.varnames[idx]
+                        ),
+                    ));
+                }
+                fastlocals[idx] = None;
                 Ok(None)
             }
             bytecode::Instruction::DeleteLocal(idx) => {
@@ -1130,7 +1137,7 @@ impl ExecutingFrame<'_> {
 
     #[cfg_attr(feature = "flame-it", flame("Frame"))]
     fn import(&mut self, vm: &VirtualMachine, module: Option<&Py<PyStr>>) -> PyResult<()> {
-        let module = module.unwrap_or(&vm.ctx.empty_str);
+        let module = module.unwrap_or(vm.ctx.empty_str);
         let from_list = <Option<PyTupleTyped<PyStrRef>>>::try_from_object(vm, self.pop_value())?;
         let level = usize::try_from_object(vm, self.pop_value())?;
 
@@ -1390,13 +1397,20 @@ impl ExecutingFrame<'_> {
         let func = self.pop_value();
         let is_method = self.pop_value().is(&vm.ctx.true_value);
         let target = self.pop_value();
-        let method = if is_method {
-            PyMethod::Function { target, func }
+
+        // TODO: It was PyMethod before #4873. Check if it's correct.
+        let func = if is_method {
+            if let Some(descr_get) = func.class().mro_find_map(|cls| cls.slots.descr_get.load()) {
+                let cls = target.class().to_owned().into();
+                descr_get(func, Some(target), Some(cls), vm)?
+            } else {
+                func
+            }
         } else {
             drop(target); // should be None
-            PyMethod::Attribute(func)
+            func
         };
-        let value = method.invoke(args, vm)?;
+        let value = func.call(args, vm)?;
         self.push_value(value);
         Ok(None)
     }
@@ -1654,7 +1668,7 @@ impl ExecutingFrame<'_> {
             bytecode::BinaryOperator::Add => vm._add(a_ref, b_ref),
             bytecode::BinaryOperator::Multiply => vm._mul(a_ref, b_ref),
             bytecode::BinaryOperator::MatrixMultiply => vm._matmul(a_ref, b_ref),
-            bytecode::BinaryOperator::Power => vm._pow(a_ref, b_ref),
+            bytecode::BinaryOperator::Power => vm._pow(a_ref, b_ref, vm.ctx.none.as_object()),
             bytecode::BinaryOperator::Divide => vm._truediv(a_ref, b_ref),
             bytecode::BinaryOperator::FloorDivide => vm._floordiv(a_ref, b_ref),
             bytecode::BinaryOperator::Modulo => vm._mod(a_ref, b_ref),
@@ -1680,7 +1694,7 @@ impl ExecutingFrame<'_> {
             bytecode::BinaryOperator::Add => vm._iadd(a_ref, b_ref),
             bytecode::BinaryOperator::Multiply => vm._imul(a_ref, b_ref),
             bytecode::BinaryOperator::MatrixMultiply => vm._imatmul(a_ref, b_ref),
-            bytecode::BinaryOperator::Power => vm._ipow(a_ref, b_ref),
+            bytecode::BinaryOperator::Power => vm._ipow(a_ref, b_ref, vm.ctx.none.as_object()),
             bytecode::BinaryOperator::Divide => vm._itruediv(a_ref, b_ref),
             bytecode::BinaryOperator::FloorDivide => vm._ifloordiv(a_ref, b_ref),
             bytecode::BinaryOperator::Modulo => vm._imod(a_ref, b_ref),

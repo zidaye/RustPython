@@ -2,21 +2,9 @@
 
 // See also:
 // https://docs.python.org/3/library/time.html
-use crate::{PyObjectRef, VirtualMachine};
-
 pub use time::*;
 
-pub(crate) fn make_module(vm: &VirtualMachine) -> PyObjectRef {
-    let module = time::make_module(vm);
-    #[cfg(unix)]
-    unix::extend_module(vm, &module);
-    #[cfg(windows)]
-    windows::extend_module(vm, &module);
-
-    module
-}
-
-#[pymodule(name = "time")]
+#[pymodule(name = "time", with(platform))]
 mod time {
     use crate::{
         builtins::{PyStrRef, PyTypeRef},
@@ -362,7 +350,10 @@ mod time {
         }
 
         fn to_date_time(&self, vm: &VirtualMachine) -> PyResult<NaiveDateTime> {
-            let invalid = || vm.new_value_error("invalid struct_time parameter".to_owned());
+            let invalid_overflow =
+                || vm.new_overflow_error("mktime argument out of range".to_owned());
+            let invalid_value = || vm.new_value_error("invalid struct_time parameter".to_owned());
+
             macro_rules! field {
                 ($field:ident) => {
                     self.$field.clone().try_into_value(vm)?
@@ -370,9 +361,9 @@ mod time {
             }
             let dt = NaiveDateTime::new(
                 NaiveDate::from_ymd_opt(field!(tm_year), field!(tm_mon), field!(tm_mday))
-                    .ok_or_else(invalid)?,
+                    .ok_or_else(invalid_value)?,
                 NaiveTime::from_hms_opt(field!(tm_hour), field!(tm_min), field!(tm_sec))
-                    .ok_or_else(invalid)?,
+                    .ok_or_else(invalid_overflow)?,
             );
             Ok(dt)
         }
@@ -386,15 +377,12 @@ mod time {
     }
 
     #[allow(unused_imports)]
-    #[cfg(unix)]
-    use super::unix::*;
-    #[cfg(windows)]
-    use super::windows::*;
+    use super::platform::*;
 }
 
 #[cfg(unix)]
-#[pymodule(name = "time")]
-mod unix {
+#[pymodule(sub)]
+mod platform {
     #[allow(unused_imports)]
     use super::{SEC_TO_NS, US_TO_NS};
     #[cfg_attr(target_os = "macos", allow(unused_imports))]
@@ -631,8 +619,8 @@ mod unix {
 }
 
 #[cfg(windows)]
-#[pymodule(name = "time")]
-mod windows {
+#[pymodule]
+mod platform {
     use super::{time_muldiv, MS_TO_NS, SEC_TO_NS};
     use crate::{
         builtins::{PyNamespace, PyStrRef},
@@ -815,3 +803,8 @@ mod windows {
         Ok(Duration::from_nanos((k_time + u_time) * 100))
     }
 }
+
+// mostly for wasm32
+#[cfg(not(any(unix, windows)))]
+#[pymodule(sub)]
+mod platform {}

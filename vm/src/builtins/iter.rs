@@ -6,8 +6,9 @@ use super::{PyInt, PyTupleRef, PyType};
 use crate::{
     class::PyClassImpl,
     function::ArgCallable,
+    object::{Traverse, TraverseFn},
     protocol::{PyIterReturn, PySequence, PySequenceMethods},
-    types::{IterNext, IterNextIterable},
+    types::{IterNext, Iterable, SelfIter},
     Context, Py, PyObject, PyObjectRef, PyPayload, PyResult, VirtualMachine,
 };
 use rustpython_common::{
@@ -24,10 +25,25 @@ pub enum IterStatus<T> {
     Exhausted,
 }
 
+unsafe impl<T: Traverse> Traverse for IterStatus<T> {
+    fn traverse(&self, tracer_fn: &mut TraverseFn) {
+        match self {
+            IterStatus::Active(ref r) => r.traverse(tracer_fn),
+            IterStatus::Exhausted => (),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct PositionIterInternal<T> {
     pub status: IterStatus<T>,
     pub position: usize,
+}
+
+unsafe impl<T: Traverse> Traverse for PositionIterInternal<T> {
+    fn traverse(&self, tracer_fn: &mut TraverseFn) {
+        self.status.traverse(tracer_fn)
+    }
 }
 
 impl<T> PositionIterInternal<T> {
@@ -158,10 +174,11 @@ pub fn builtins_reversed(vm: &VirtualMachine) -> &PyObject {
     INSTANCE.get_or_init(|| vm.builtins.get_attr("reversed", vm).unwrap())
 }
 
-#[pyclass(module = false, name = "iterator")]
+#[pyclass(module = false, name = "iterator", traverse)]
 #[derive(Debug)]
 pub struct PySequenceIterator {
     // cached sequence methods
+    #[pytraverse(skip)]
     seq_methods: &'static PySequenceMethods,
     internal: PyMutex<PositionIterInternal<PyObjectRef>>,
 }
@@ -172,7 +189,7 @@ impl PyPayload for PySequenceIterator {
     }
 }
 
-#[pyclass(with(IterNext))]
+#[pyclass(with(IterNext, Iterable))]
 impl PySequenceIterator {
     pub fn new(obj: PyObjectRef, vm: &VirtualMachine) -> PyResult<Self> {
         let seq = PySequence::try_protocol(&obj, vm)?;
@@ -209,7 +226,7 @@ impl PySequenceIterator {
     }
 }
 
-impl IterNextIterable for PySequenceIterator {}
+impl SelfIter for PySequenceIterator {}
 impl IterNext for PySequenceIterator {
     fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         zelf.internal.lock().next(|obj, pos| {
@@ -222,7 +239,7 @@ impl IterNext for PySequenceIterator {
     }
 }
 
-#[pyclass(module = false, name = "callable_iterator")]
+#[pyclass(module = false, name = "callable_iterator", traverse)]
 #[derive(Debug)]
 pub struct PyCallableIterator {
     sentinel: PyObjectRef,
@@ -235,7 +252,7 @@ impl PyPayload for PyCallableIterator {
     }
 }
 
-#[pyclass(with(IterNext))]
+#[pyclass(with(IterNext, Iterable))]
 impl PyCallableIterator {
     pub fn new(callable: ArgCallable, sentinel: PyObjectRef) -> Self {
         Self {
@@ -245,7 +262,7 @@ impl PyCallableIterator {
     }
 }
 
-impl IterNextIterable for PyCallableIterator {}
+impl SelfIter for PyCallableIterator {}
 impl IterNext for PyCallableIterator {
     fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         let status = zelf.status.upgradable_read();

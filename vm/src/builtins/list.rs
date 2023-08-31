@@ -13,8 +13,8 @@ use crate::{
     sequence::{MutObjectSequenceOp, OptionalRangeArgs, SequenceExt, SequenceMutExt},
     sliceable::{SequenceIndex, SliceableSequenceMutOp, SliceableSequenceOp},
     types::{
-        AsMapping, AsSequence, Comparable, Constructor, Initializer, IterNext, IterNextIterable,
-        Iterable, PyComparisonOp, Representable, Unconstructible,
+        AsMapping, AsSequence, Comparable, Constructor, Initializer, IterNext, Iterable,
+        PyComparisonOp, Representable, SelfIter, Unconstructible,
     },
     utils::collection_repr,
     vm::VirtualMachine,
@@ -22,7 +22,7 @@ use crate::{
 };
 use std::{fmt, ops::DerefMut};
 
-#[pyclass(module = false, name = "list", unhashable = true)]
+#[pyclass(module = false, name = "list", unhashable = true, traverse)]
 #[derive(Default)]
 pub struct PyList {
     elements: PyRwLock<Vec<PyObjectRef>>,
@@ -86,10 +86,11 @@ impl PyList {
     }
 }
 
-#[derive(FromArgs, Default)]
+#[derive(FromArgs, Default, Traverse)]
 pub(crate) struct SortOptions {
     #[pyarg(named, default)]
     key: Option<PyObjectRef>,
+    #[pytraverse(skip)]
     #[pyarg(named, default = "false")]
     reverse: bool,
 }
@@ -530,7 +531,7 @@ fn do_sort(
     Ok(())
 }
 
-#[pyclass(module = false, name = "list_iterator")]
+#[pyclass(module = false, name = "list_iterator", traverse)]
 #[derive(Debug)]
 pub struct PyListIterator {
     internal: PyMutex<PositionIterInternal<PyListRef>>,
@@ -542,7 +543,7 @@ impl PyPayload for PyListIterator {
     }
 }
 
-#[pyclass(with(Constructor, IterNext))]
+#[pyclass(with(Constructor, IterNext, Iterable))]
 impl PyListIterator {
     #[pymethod(magic)]
     fn length_hint(&self) -> usize {
@@ -565,7 +566,7 @@ impl PyListIterator {
 }
 impl Unconstructible for PyListIterator {}
 
-impl IterNextIterable for PyListIterator {}
+impl SelfIter for PyListIterator {}
 impl IterNext for PyListIterator {
     fn next(zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         zelf.internal.lock().next(|list, pos| {
@@ -575,7 +576,7 @@ impl IterNext for PyListIterator {
     }
 }
 
-#[pyclass(module = false, name = "list_reverseiterator")]
+#[pyclass(module = false, name = "list_reverseiterator", traverse)]
 #[derive(Debug)]
 pub struct PyListReverseIterator {
     internal: PyMutex<PositionIterInternal<PyListRef>>,
@@ -587,7 +588,7 @@ impl PyPayload for PyListReverseIterator {
     }
 }
 
-#[pyclass(with(Constructor, IterNext))]
+#[pyclass(with(Constructor, IterNext, Iterable))]
 impl PyListReverseIterator {
     #[pymethod(magic)]
     fn length_hint(&self) -> usize {
@@ -610,7 +611,7 @@ impl PyListReverseIterator {
 }
 impl Unconstructible for PyListReverseIterator {}
 
-impl IterNextIterable for PyListReverseIterator {}
+impl SelfIter for PyListReverseIterator {}
 impl IterNext for PyListReverseIterator {
     fn next(zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         zelf.internal.lock().rev_next(|list, pos| {

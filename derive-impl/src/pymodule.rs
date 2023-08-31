@@ -2,9 +2,9 @@ use crate::error::Diagnostic;
 use crate::util::{
     format_doc, iter_use_idents, pyclass_ident_and_attrs, text_signature, AttrItemMeta,
     AttributeExt, ClassItemMeta, ContentItem, ContentItemInner, ErrorVec, ItemMeta, ItemNursery,
-    SimpleItemMeta, ALL_ALLOWED_NAMES,
+    ModuleItemMeta, SimpleItemMeta, ALL_ALLOWED_NAMES,
 };
-use proc_macro2::{Span, TokenStream};
+use proc_macro2::TokenStream;
 use quote::{quote, quote_spanned, ToTokens};
 use std::{collections::HashSet, str::FromStr};
 use syn::{parse_quote, spanned::Spanned, Attribute, AttributeArgs, Ident, Item, Result};
@@ -45,7 +45,9 @@ impl FromStr for AttrName {
 #[derive(Default)]
 struct ModuleContext {
     name: String,
-    module_extend_items: ItemNursery,
+    function_items: FunctionNursery,
+    attribute_items: ItemNursery,
+    has_extend_module: bool, // TODO: check if `fn extend_module` exists
     errors: Vec<syn::Error>,
 }
 
@@ -56,7 +58,7 @@ pub fn impl_pymodule(attr: AttributeArgs, module_item: Item) -> Result<TokenStre
     };
     let fake_ident = Ident::new("pymodule", module_item.span());
     let module_meta =
-        SimpleItemMeta::from_nested(module_item.ident.clone(), fake_ident, attr.into_iter())?;
+        ModuleItemMeta::from_nested(module_item.ident.clone(), fake_ident, attr.into_iter())?;
 
     // generation resources
     let mut context = ModuleContext {
@@ -91,7 +93,8 @@ pub fn impl_pymodule(attr: AttributeArgs, module_item: Item) -> Result<TokenStre
 
     // append additional items
     let module_name = context.name.as_str();
-    let module_extend_items = context.module_extend_items.validate()?;
+    let function_items = context.function_items.validate()?;
+    let attribute_items = context.attribute_items.validate()?;
     let doc = doc.or_else(|| {
         crate::doc::Database::shared()
             .try_path(module_name)
@@ -104,29 +107,105 @@ pub fn impl_pymodule(attr: AttributeArgs, module_item: Item) -> Result<TokenStre
     } else {
         quote!(None)
     };
+    let is_submodule = module_meta.sub()?;
+    let withs = module_meta.with()?;
+    if !is_submodule {
+        items.extend(iter_chain![
+            parse_quote! {
+                pub(crate) const MODULE_NAME: &'static str = #module_name;
+            },
+            parse_quote! {
+                pub(crate) const DOC: Option<&'static str> = #doc;
+            },
+            parse_quote! {
+                pub(crate) fn __module_def(
+                    ctx: &::rustpython_vm::Context,
+                ) -> &'static ::rustpython_vm::builtins::PyModuleDef {
+                    DEF.get_or_init(|| {
+                        #[allow(clippy::ptr_arg)]
+                        let method_defs = {
+                            let mut method_defs = Vec::new();
+                            extend_method_def(ctx, &mut method_defs);
+                            method_defs
+                        };
+                        let mut def = ::rustpython_vm::builtins::PyModuleDef {
+                            name: ctx.intern_str(MODULE_NAME),
+                            doc: DOC.map(|doc| ctx.intern_str(doc)),
+                            methods: Box::leak(method_defs.into_boxed_slice()),
+                            slots: Default::default(),
+                        };
+                        def.slots.exec = Some(extend_module);
+                        def
+                    })
+                }
+            },
+            parse_quote! {
+                #[allow(dead_code)]
+                pub(crate) fn make_module(
+                    vm: &::rustpython_vm::VirtualMachine
+                ) -> ::rustpython_vm::PyRef<::rustpython_vm::builtins::PyModule> {
+                    use ::rustpython_vm::PyPayload;
+                    let module = ::rustpython_vm::builtins::PyModule::from_def(__module_def(&vm.ctx)).into_ref(&vm.ctx);
+                    __init_dict(vm, &module);
+                    extend_module(vm, &module).unwrap();
+                    module
+                }
+            },
+        ]);
+    }
+    if !is_submodule && !context.has_extend_module {
+        items.push(parse_quote! {
+            pub(crate) fn extend_module(vm: &::rustpython_vm::VirtualMachine, module: &::rustpython_vm::Py<::rustpython_vm::builtins::PyModule>) -> ::rustpython_vm::PyResult<()> {
+                __extend_module(vm, module);
+                Ok(())
+            }
+        });
+    }
     items.extend(iter_chain![
         parse_quote! {
-            pub(crate) const MODULE_NAME: &'static str = #module_name;
-        },
-        parse_quote! {
-            pub(crate) const DOC: Option<&'static str> = #doc;
-        },
-        parse_quote! {
-            pub(crate) fn extend_module(
-                vm: &::rustpython_vm::VirtualMachine,
-                module: &::rustpython_vm::PyObject,
-            ) {
-                #module_extend_items
+            ::rustpython_vm::common::static_cell! {
+                pub(crate) static DEF: ::rustpython_vm::builtins::PyModuleDef;
             }
         },
         parse_quote! {
-            #[allow(dead_code)]
-            pub(crate) fn make_module(
-                vm: &::rustpython_vm::VirtualMachine
-            ) -> ::rustpython_vm::PyObjectRef {
-                let module = vm.new_module(MODULE_NAME, vm.ctx.new_dict(), DOC);
-                extend_module(vm, &module);
-                module
+            #[allow(clippy::ptr_arg)]
+            pub(crate) fn extend_method_def(
+                ctx: &::rustpython_vm::Context,
+                method_defs: &mut Vec<::rustpython_vm::function::PyMethodDef>,
+            ) {
+                #(
+                    super::#withs::extend_method_def(ctx, method_defs);
+                )*
+                #function_items
+            }
+        },
+        parse_quote! {
+            pub(crate) fn __init_attributes(
+                vm: &::rustpython_vm::VirtualMachine,
+                module: &::rustpython_vm::Py<::rustpython_vm::builtins::PyModule>,
+            ) {
+                #(
+                    super::#withs::__init_attributes(vm, module);
+                )*
+                let ctx = &vm.ctx;
+                #attribute_items
+            }
+        },
+        parse_quote! {
+            pub(crate) fn __extend_module(
+                vm: &::rustpython_vm::VirtualMachine,
+                module: &::rustpython_vm::Py<::rustpython_vm::builtins::PyModule>,
+            ) {
+                module.__init_methods(vm).unwrap();
+                __init_attributes(vm, module);
+            }
+        },
+        parse_quote! {
+            pub(crate) fn __init_dict(
+                vm: &::rustpython_vm::VirtualMachine,
+                module: &::rustpython_vm::Py<::rustpython_vm::builtins::PyModule>,
+            ) {
+                ::rustpython_vm::builtins::PyModule::__init_dict_from_def(vm, module);
             }
         },
     ]);
@@ -248,6 +327,63 @@ where
     Ok((result, cfgs))
 }
 
+#[derive(Default)]
+struct FunctionNursery {
+    items: Vec<FunctionNurseryItem>,
+}
+
+struct FunctionNurseryItem {
+    py_names: Vec<String>,
+    cfgs: Vec<Attribute>,
+    ident: Ident,
+    doc: String,
+}
+
+impl FunctionNursery {
+    fn add_item(&mut self, item: FunctionNurseryItem) {
+        self.items.push(item);
+    }
+
+    fn validate(self) -> Result<ValidatedFunctionNursery> {
+        let mut name_set = HashSet::new();
+        for item in &self.items {
+            for py_name in &item.py_names {
+                if !name_set.insert((py_name.to_owned(), &item.cfgs)) {
+                    bail_span!(item.ident, "duplicate method name `{}`", py_name);
+                }
+            }
+        }
+        Ok(ValidatedFunctionNursery(self))
+    }
+}
+
+struct ValidatedFunctionNursery(FunctionNursery);
+
+impl ToTokens for ValidatedFunctionNursery {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        for item in &self.0.items {
+            let ident = &item.ident;
+            let cfgs = &item.cfgs;
+            let py_names = &item.py_names;
+            let doc = &item.doc;
+            let flags = quote! { rustpython_vm::function::PyMethodFlags::empty() };
+
+            tokens.extend(quote! {
+                #(#cfgs)*
+                {
+                    let doc = Some(#doc);
+                    #(method_defs.push(rustpython_vm::function::PyMethodDef::new(
+                        (#py_names),
+                        #ident,
+                        #flags,
+                        doc,
+                    ));)*
+                }
+            });
+        }
+    }
+}
+
 /// #[pyfunction]
 struct FunctionItem {
     inner: ContentItemInner<AttrName>,
@@ -318,37 +454,23 @@ impl ModuleItem for FunctionItem {
         let py_name = item_meta.simple_name()?;
         let sig_doc = text_signature(func.sig(), &py_name);
 
-        let (tokens, py_names) = {
-            let module = args.module_name();
-            let doc = args.attrs.doc().or_else(|| {
-                crate::doc::Database::shared()
-                    .try_module_item(module, &py_name)
-                    .ok() // TODO: doc must exist at least one of code or CPython
-                    .flatten()
-                    .map(str::to_owned)
-            });
-            let doc = if let Some(doc) = doc {
-                format_doc(&sig_doc, &doc)
-            } else {
-                sig_doc
-            };
-            let doc = quote!(.with_doc(#doc.to_owned(), &vm.ctx));
-            let new_func = quote_spanned!(ident.span()=>
-                vm.ctx.make_func_def(vm.ctx.intern_str(#py_name), #ident)
-                    #doc
-                    .into_function()
-                    .with_module(vm.new_pyobj(#module.to_owned()))
-                    .into_ref(&vm.ctx)
-            );
+        let module = args.module_name();
+        let doc = args.attrs.doc().or_else(|| {
+            crate::doc::Database::shared()
+                .try_module_item(module, &py_name)
+                .ok() // TODO: doc must exist at least one of code or CPython
+                .flatten()
+                .map(str::to_owned)
+        });
+        let doc = if let Some(doc) = doc {
+            format_doc(&sig_doc, &doc)
+        } else {
+            sig_doc
+        };
 
+        let py_names = {
             if self.py_attrs.is_empty() {
-                (
-                    quote_spanned! { ident.span() => {
-                        let func = #new_func;
-                        vm.__module_set_attr(module, #py_name, func).unwrap();
-                    }},
-                    vec![py_name],
-                )
+                vec![py_name]
             } else {
                 let mut py_names = HashSet::new();
                 py_names.insert(py_name);
@@ -373,25 +495,16 @@ impl ModuleItem for FunctionItem {
                     args.context.errors.ok_or_push(r);
                 }
                 let py_names: Vec<_> = py_names.into_iter().collect();
-                (
-                    quote_spanned! { ident.span().resolved_at(Span::call_site()) => {
-                        let func = #new_func;
-                        for name in [#(#py_names,)*] {
-                            vm.__module_set_attr(module, name, func.clone()).unwrap();
-                        }
-                    }},
-                    py_names,
-                )
+                py_names
             }
         };
 
-        args.context.module_extend_items.add_item(
-            ident.clone(),
+        args.context.function_items.add_item(FunctionNurseryItem {
+            ident: ident.to_owned(),
             py_names,
-            args.cfgs.to_vec(),
-            tokens,
-            10,
-        )?;
+            cfgs: args.cfgs.to_vec(),
+            doc,
+        });
         Ok(())
     }
 }
@@ -432,8 +545,8 @@ impl ModuleItem for ClassItem {
                 class_meta.class_name()?
             };
             let class_new = quote_spanned!(ident.span() =>
-                let new_class = <#ident as ::rustpython_vm::class::PyClassImpl>::make_class(&vm.ctx);
-                new_class.set_attr(rustpython_vm::identifier!(vm, __module__), vm.new_pyobj(#module_name));
+                let new_class = <#ident as ::rustpython_vm::class::PyClassImpl>::make_class(ctx);
+                new_class.set_attr(rustpython_vm::identifier!(ctx, __module__), vm.new_pyobj(#module_name));
             );
             (class_name, class_new)
         };
@@ -463,17 +576,17 @@ impl ModuleItem for ClassItem {
             1 => {
                 let py_name = &py_names[0];
                 quote! {
-                    vm.__module_set_attr(&module, #py_name, new_class).unwrap();
+                    vm.__module_set_attr(&module, vm.ctx.intern_str(#py_name), new_class).unwrap();
                 }
             }
             _ => quote! {
                 for name in [#(#py_names,)*] {
-                    vm.__module_set_attr(&module, name, new_class.clone()).unwrap();
+                    vm.__module_set_attr(&module, vm.ctx.intern_str(name), new_class.clone()).unwrap();
                 }
             },
         };
 
-        args.context.module_extend_items.add_item(
+        args.context.attribute_items.add_item(
             ident.clone(),
             py_names,
             args.cfgs.to_vec(),
@@ -559,9 +672,9 @@ impl ModuleItem for AttributeItem {
                         ident.to_string()
                     };
                     let tokens = quote_spanned! { ident.span() =>
-                        vm.__module_set_attr(module, #py_name, vm.new_pyobj(#ident)).unwrap();
+                        vm.__module_set_attr(module, vm.ctx.intern_str(#py_name), vm.new_pyobj(#ident)).unwrap();
                     };
-                    args.context.module_extend_items.add_item(
+                    args.context.attribute_items.add_item(
                         ident.clone(),
                         vec![py_name],
                         cfgs.clone(),
@@ -583,7 +696,7 @@ impl ModuleItem for AttributeItem {
             (
                 quote_spanned! { ident.span() => {
                     #let_obj
-                    vm.__module_set_attr(module, #py_name, obj).unwrap();
+                    vm.__module_set_attr(module, vm.ctx.intern_str(#py_name), obj).unwrap();
                 }},
                 vec![py_name],
             )
@@ -616,7 +729,7 @@ impl ModuleItem for AttributeItem {
                 quote_spanned! { ident.span() => {
                     #let_obj
                     for name in [(#(#names,)*)] {
-                        vm.__module_set_attr(module, name, obj.clone()).unwrap();
+                        vm.__module_set_attr(module, vm.ctx.intern_str(name), obj.clone()).unwrap();
                     }
                 }},
                 names,
@@ -624,7 +737,7 @@ impl ModuleItem for AttributeItem {
         };
 
         args.context
-            .module_extend_items
+            .attribute_items
             .add_item(ident, py_names, cfgs, tokens, 1)?;
 
         Ok(())

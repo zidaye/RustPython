@@ -1,13 +1,15 @@
 //! Implement python as a virtual machine with bytecode. This module
 //! implements bytecode structure.
 
-use crate::{marshal, Location};
 use bitflags::bitflags;
 use itertools::Itertools;
-use num_bigint::BigInt;
+use malachite_bigint::BigInt;
 use num_complex::Complex64;
+use rustpython_parser_core::source_code::{OneIndexed, SourceLocation};
 use std::marker::PhantomData;
 use std::{collections::BTreeSet, fmt, hash, mem};
+
+pub use rustpython_parser_core::ConversionFlag;
 
 pub trait Constant: Sized {
     type Name: AsRef<str>;
@@ -89,14 +91,14 @@ impl ConstantBag for BasicBag {
 #[derive(Clone)]
 pub struct CodeObject<C: Constant = ConstantData> {
     pub instructions: Box<[CodeUnit]>,
-    pub locations: Box<[Location]>,
+    pub locations: Box<[SourceLocation]>,
     pub flags: CodeFlags,
     pub posonlyarg_count: u32,
     // Number of positional-only arguments
     pub arg_count: u32,
     pub kwonlyarg_count: u32,
     pub source_path: C::Name,
-    pub first_line_number: u32,
+    pub first_line_number: Option<OneIndexed>,
     pub max_stackdepth: u32,
     pub obj_name: C::Name,
     // Name of the object that created this code object
@@ -109,6 +111,7 @@ pub struct CodeObject<C: Constant = ConstantData> {
 }
 
 bitflags! {
+    #[derive(Copy, Clone, Debug, PartialEq)]
     pub struct CodeFlags: u16 {
         const NEW_LOCALS = 0x01;
         const IS_GENERATOR = 0x02;
@@ -125,7 +128,7 @@ impl CodeFlags {
         ("COROUTINE", CodeFlags::IS_COROUTINE),
         (
             "ASYNC_GENERATOR",
-            Self::from_bits_truncate(Self::IS_GENERATOR.bits | Self::IS_COROUTINE.bits),
+            Self::from_bits_truncate(Self::IS_GENERATOR.bits() | Self::IS_COROUTINE.bits()),
         ),
         ("VARARGS", CodeFlags::HAS_VARARGS),
         ("VARKEYWORDS", CodeFlags::HAS_VARKEYWORDS),
@@ -230,13 +233,8 @@ impl OpArgType for bool {
     }
 }
 
-macro_rules! op_arg_enum {
-    ($(#[$attr:meta])* $vis:vis enum $name:ident { $($(#[$var_attr:meta])* $var:ident = $value:literal,)* }) => {
-        $(#[$attr])*
-        $vis enum $name {
-            $($(#[$var_attr])* $var = $value,)*
-        }
-
+macro_rules! op_arg_enum_impl {
+    (enum $name:ident { $($(#[$var_attr:meta])* $var:ident = $value:literal,)* }) => {
         impl OpArgType for $name {
             fn to_op_arg(self) -> u32 {
                 self as u32
@@ -248,6 +246,19 @@ macro_rules! op_arg_enum {
                 })
             }
         }
+    };
+}
+
+macro_rules! op_arg_enum {
+    ($(#[$attr:meta])* $vis:vis enum $name:ident { $($(#[$var_attr:meta])* $var:ident = $value:literal,)* }) => {
+        $(#[$attr])*
+        $vis enum $name {
+            $($(#[$var_attr])* $var = $value,)*
+        }
+
+        op_arg_enum_impl!(enum $name {
+            $($(#[$var_attr])* $var = $value,)*
+        });
     };
 }
 
@@ -325,26 +336,20 @@ impl fmt::Display for Label {
     }
 }
 
-op_arg_enum!(
-    /// Transforms a value prior to formatting it.
-    #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-    #[repr(u8)]
-    pub enum ConversionFlag {
-        /// No conversion
-        None = 0, // CPython uses -1 but not pleasure for us
-        /// Converts by calling `str(<value>)`.
-        Str = b's',
-        /// Converts by calling `ascii(<value>)`.
-        Ascii = b'a',
-        /// Converts by calling `repr(<value>)`.
-        Repr = b'r',
+impl OpArgType for ConversionFlag {
+    #[inline]
+    fn from_op_arg(x: u32) -> Option<Self> {
+        match x as u8 {
+            b's' => Some(ConversionFlag::Str),
+            b'a' => Some(ConversionFlag::Ascii),
+            b'r' => Some(ConversionFlag::Repr),
+            std::u8::MAX => Some(ConversionFlag::None),
+            _ => None,
+        }
     }
-);
-
-impl TryFrom<usize> for ConversionFlag {
-    type Error = usize;
-    fn try_from(b: usize) -> Result<Self, Self::Error> {
-        u32::try_from(b).ok().and_then(Self::from_op_arg).ok_or(b)
+    #[inline]
+    fn to_op_arg(self) -> u32 {
+        self as i8 as u8 as u32
     }
 }
 
@@ -625,6 +630,7 @@ impl CodeUnit {
 use self::Instruction::*;
 
 bitflags! {
+    #[derive(Copy, Clone, Debug, PartialEq)]
     pub struct MakeFunctionFlags: u8 {
         const CLOSURE = 0x01;
         const ANNOTATIONS = 0x02;
@@ -635,7 +641,7 @@ bitflags! {
 impl OpArgType for MakeFunctionFlags {
     #[inline(always)]
     fn from_op_arg(x: u32) -> Option<Self> {
-        Some(unsafe { MakeFunctionFlags::from_bits_unchecked(x as u8) })
+        MakeFunctionFlags::from_bits(x as u8)
     }
     #[inline(always)]
     fn to_op_arg(self) -> u32 {
@@ -647,7 +653,7 @@ impl OpArgType for MakeFunctionFlags {
 ///
 /// # Examples
 /// ```
-/// use rustpython_compiler_core::ConstantData;
+/// use rustpython_compiler_core::bytecode::ConstantData;
 /// let a = ConstantData::Float {value: 120f64};
 /// let b = ConstantData::Boolean {value: false};
 /// assert_ne!(a, b);
@@ -974,14 +980,14 @@ impl<C: Constant> CodeObject<C> {
         let label_targets = self.label_targets();
         let line_digits = (3).max(self.locations.last().unwrap().row.to_string().len());
         let offset_digits = (4).max(self.instructions.len().to_string().len());
-        let mut last_line = u32::MAX;
+        let mut last_line = OneIndexed::MAX;
         let mut arg_state = OpArgState::default();
         for (offset, &instruction) in self.instructions.iter().enumerate() {
             let (instruction, arg) = arg_state.get(instruction);
             // optional line number
             let line = self.locations[offset].row;
             if line != last_line {
-                if last_line != u32::MAX {
+                if last_line != OneIndexed::MAX {
                     writeln!(f)?;
                 }
                 last_line = line;
@@ -1128,7 +1134,7 @@ impl Instruction {
     /// # Examples
     ///
     /// ```
-    /// use rustpython_compiler_core::{Arg, Instruction};
+    /// use rustpython_compiler_core::bytecode::{Arg, Instruction};
     /// let jump_inst = Instruction::Jump { target: Arg::marker() };
     /// assert!(jump_inst.unconditional_branch())
     /// ```
@@ -1144,7 +1150,7 @@ impl Instruction {
     /// # Examples
     ///
     /// ```
-    /// use rustpython_compiler_core::{Arg, Instruction, Label, UnaryOperator};
+    /// use rustpython_compiler_core::bytecode::{Arg, Instruction, Label, UnaryOperator};
     /// let (target, jump_arg) = Arg::new(Label(0xF));
     /// let jump_instruction = Instruction::Jump { target };
     /// let (op, invert_arg) = Arg::new(UnaryOperator::Invert);
@@ -1469,142 +1475,7 @@ impl<C: Constant> fmt::Debug for CodeObject<C> {
             "<code object {} at ??? file {:?}, line {}>",
             self.obj_name.as_ref(),
             self.source_path.as_ref(),
-            self.first_line_number
+            self.first_line_number.map_or(-1, |x| x.get() as i32)
         )
-    }
-}
-
-pub mod frozen_lib {
-    use super::*;
-    use marshal::{Read, ReadBorrowed, Write};
-
-    /// A frozen module. Holds a frozen code object and whether it is part of a package
-    #[derive(Copy, Clone)]
-    pub struct FrozenModule<B = &'static [u8]> {
-        pub code: FrozenCodeObject<B>,
-        pub package: bool,
-    }
-
-    #[derive(Copy, Clone)]
-    pub struct FrozenCodeObject<B> {
-        pub bytes: B,
-    }
-
-    impl<B: AsRef<[u8]>> FrozenCodeObject<B> {
-        /// Decode a frozen code object
-        #[inline]
-        pub fn decode<Bag: AsBag>(
-            &self,
-            bag: Bag,
-        ) -> CodeObject<<Bag::Bag as ConstantBag>::Constant> {
-            Self::_decode(self.bytes.as_ref(), bag.as_bag())
-        }
-        fn _decode<Bag: ConstantBag>(data: &[u8], bag: Bag) -> CodeObject<Bag::Constant> {
-            let decompressed = lz4_flex::decompress_size_prepended(data)
-                .expect("deserialize frozen CodeObject failed");
-            marshal::deserialize_code(&mut &decompressed[..], bag)
-                .expect("deserializing frozen CodeObject failed")
-        }
-    }
-
-    impl FrozenCodeObject<Vec<u8>> {
-        pub fn encode<C: Constant>(code: &CodeObject<C>) -> Self {
-            let mut data = Vec::new();
-            marshal::serialize_code(&mut data, code);
-            let bytes = lz4_flex::compress_prepend_size(&data);
-            FrozenCodeObject { bytes }
-        }
-    }
-
-    #[repr(transparent)]
-    pub struct FrozenLib<B: ?Sized = [u8]> {
-        pub bytes: B,
-    }
-
-    impl<B: AsRef<[u8]> + ?Sized> FrozenLib<B> {
-        pub const fn from_ref(b: &B) -> &FrozenLib<B> {
-            unsafe { &*(b as *const B as *const FrozenLib<B>) }
-        }
-
-        /// Decode a library to a iterable of frozen modules
-        pub fn decode(&self) -> FrozenModulesIter<'_> {
-            let mut data = self.bytes.as_ref();
-            let remaining = data.read_u32().unwrap();
-            FrozenModulesIter { remaining, data }
-        }
-    }
-
-    impl<'a, B: AsRef<[u8]> + ?Sized> IntoIterator for &'a FrozenLib<B> {
-        type Item = (&'a str, FrozenModule<&'a [u8]>);
-        type IntoIter = FrozenModulesIter<'a>;
-        fn into_iter(self) -> Self::IntoIter {
-            self.decode()
-        }
-    }
-
-    pub struct FrozenModulesIter<'a> {
-        remaining: u32,
-        data: &'a [u8],
-    }
-
-    impl<'a> Iterator for FrozenModulesIter<'a> {
-        type Item = (&'a str, FrozenModule<&'a [u8]>);
-
-        fn next(&mut self) -> Option<Self::Item> {
-            if self.remaining > 0 {
-                let entry = read_entry(&mut self.data).unwrap();
-                self.remaining -= 1;
-                Some(entry)
-            } else {
-                None
-            }
-        }
-
-        fn size_hint(&self) -> (usize, Option<usize>) {
-            (self.remaining as usize, Some(self.remaining as usize))
-        }
-    }
-    impl ExactSizeIterator for FrozenModulesIter<'_> {}
-
-    fn read_entry<'a>(
-        rdr: &mut &'a [u8],
-    ) -> Result<(&'a str, FrozenModule<&'a [u8]>), marshal::MarshalError> {
-        let len = rdr.read_u32()?;
-        let name = rdr.read_str_borrow(len)?;
-        let len = rdr.read_u32()?;
-        let code_slice = rdr.read_slice_borrow(len)?;
-        let code = FrozenCodeObject { bytes: code_slice };
-        let package = rdr.read_u8()? != 0;
-        Ok((name, FrozenModule { code, package }))
-    }
-
-    impl FrozenLib<Vec<u8>> {
-        /// Encode the given iterator of frozen modules into a compressed vector of bytes
-        pub fn encode<'a, I, B: AsRef<[u8]>>(lib: I) -> FrozenLib<Vec<u8>>
-        where
-            I: IntoIterator<Item = (&'a str, FrozenModule<B>)>,
-            I::IntoIter: ExactSizeIterator + Clone,
-        {
-            let iter = lib.into_iter();
-            let mut bytes = Vec::new();
-            write_lib(&mut bytes, iter);
-            Self { bytes }
-        }
-    }
-
-    fn write_lib<'a, B: AsRef<[u8]>>(
-        buf: &mut Vec<u8>,
-        lib: impl ExactSizeIterator<Item = (&'a str, FrozenModule<B>)>,
-    ) {
-        marshal::write_len(buf, lib.len());
-        for (name, module) in lib {
-            write_entry(buf, name, module);
-        }
-    }
-
-    fn write_entry(buf: &mut Vec<u8>, name: &str, module: FrozenModule<impl AsRef<[u8]>>) {
-        marshal::write_vec(buf, name.as_bytes());
-        marshal::write_vec(buf, module.code.bytes.as_ref());
-        buf.write_u8(module.package as u8);
     }
 }

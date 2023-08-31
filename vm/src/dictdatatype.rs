@@ -3,14 +3,17 @@
 //! And: https://www.youtube.com/watch?v=p33CVV29OG8
 //! And: http://code.activestate.com/recipes/578375/
 
-use crate::common::{
-    hash,
-    lock::{PyRwLock, PyRwLockReadGuard, PyRwLockWriteGuard},
-};
 use crate::{
     builtins::{PyInt, PyStr, PyStrInterned, PyStrRef},
     convert::ToPyObject,
     AsObject, Py, PyExact, PyObject, PyObjectRef, PyRefExact, PyResult, VirtualMachine,
+};
+use crate::{
+    common::{
+        hash,
+        lock::{PyRwLock, PyRwLockReadGuard, PyRwLockWriteGuard},
+    },
+    object::{Traverse, TraverseFn},
 };
 use num_traits::ToPrimitive;
 use std::{fmt, mem::size_of, ops::ControlFlow};
@@ -29,6 +32,12 @@ type EntryIndex = usize;
 
 pub struct Dict<T = PyObjectRef> {
     inner: PyRwLock<DictInner<T>>,
+}
+
+unsafe impl<T: Traverse> Traverse for Dict<T> {
+    fn traverse(&self, tracer_fn: &mut TraverseFn) {
+        self.inner.traverse(tracer_fn);
+    }
 }
 
 impl<T> fmt::Debug for Dict<T> {
@@ -67,6 +76,20 @@ struct DictInner<T> {
     filled: usize,
     indices: Vec<IndexEntry>,
     entries: Vec<Option<DictEntry<T>>>,
+}
+
+unsafe impl<T: Traverse> Traverse for DictInner<T> {
+    fn traverse(&self, tracer_fn: &mut TraverseFn) {
+        self.entries
+            .iter()
+            .map(|v| {
+                if let Some(v) = v {
+                    v.key.traverse(tracer_fn);
+                    v.value.traverse(tracer_fn);
+                }
+            })
+            .count();
+    }
 }
 
 impl<T: Clone> Clone for Dict<T> {
@@ -632,7 +655,7 @@ impl<T: Clone> Dict<T> {
     }
 
     pub fn pop_back(&self) -> Option<(PyObjectRef, T)> {
-        let mut inner = &mut *self.write();
+        let inner = &mut *self.write();
         let entry = loop {
             let entry = inner.entries.pop()?;
             if let Some(entry) = entry {

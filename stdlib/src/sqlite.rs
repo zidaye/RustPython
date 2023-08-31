@@ -8,13 +8,13 @@
 // spell-checker:ignore cantlock commithook foreignkey notnull primarykey gettemppath autoindex convpath
 // spell-checker:ignore dbmoved vnode nbytes
 
-use rustpython_vm::{PyObjectRef, VirtualMachine};
+use rustpython_vm::{builtins::PyModule, AsObject, PyRef, VirtualMachine};
 
 // pub(crate) use _sqlite::make_module;
-pub(crate) fn make_module(vm: &VirtualMachine) -> PyObjectRef {
+pub(crate) fn make_module(vm: &VirtualMachine) -> PyRef<PyModule> {
     // TODO: sqlite version check
     let module = _sqlite::make_module(vm);
-    _sqlite::setup_module(&module, vm);
+    _sqlite::setup_module(module.as_object(), vm);
     module
 }
 
@@ -45,6 +45,7 @@ mod _sqlite {
         SQLITE_NULL, SQLITE_OPEN_CREATE, SQLITE_OPEN_READWRITE, SQLITE_OPEN_URI, SQLITE_TEXT,
         SQLITE_TRACE_STMT, SQLITE_TRANSIENT, SQLITE_UTF8,
     };
+    use malachite_bigint::Sign;
     use rustpython_common::{
         atomic::{Ordering, PyAtomic, Radium},
         hash::PyHash,
@@ -62,13 +63,14 @@ mod _sqlite {
         protocol::{PyBuffer, PyIterReturn, PyMappingMethods, PySequence, PySequenceMethods},
         sliceable::{SaturatedSliceIter, SliceableSequenceOp},
         types::{
-            AsMapping, AsSequence, Callable, Comparable, Constructor, Hashable, IterNext,
-            IterNextIterable, Iterable, PyComparisonOp,
+            AsMapping, AsSequence, Callable, Comparable, Constructor, Hashable, IterNext, Iterable,
+            PyComparisonOp, SelfIter,
         },
         utils::ToCString,
         AsObject, Py, PyAtomicRef, PyObject, PyObjectRef, PyPayload, PyRef, PyResult,
         TryFromBorrowedObject, VirtualMachine,
         __exports::paste,
+        object::{Traverse, TraverseFn},
     };
     use std::{
         ffi::{c_int, c_longlong, c_uint, c_void, CStr},
@@ -97,8 +99,11 @@ mod _sqlite {
                 )*
                 fn setup_module_exceptions(module: &PyObject, vm: &VirtualMachine) {
                     $(
-                        let exception = [<$x:snake:upper>].get_or_init(
-                            || vm.ctx.new_exception_type("_sqlite3", stringify!($x), Some(vec![$base(vm).to_owned()])));
+                        #[allow(clippy::redundant_closure_call)]
+                        let exception = [<$x:snake:upper>].get_or_init(|| {
+                            let base = $base(vm);
+                            vm.ctx.new_exception_type("_sqlite3", stringify!($x), Some(vec![base.to_owned()]))
+                        });
                         module.set_attr(stringify!($x), exception.clone().into_object(), vm).unwrap();
                     )*
                 }
@@ -297,7 +302,7 @@ mod _sqlite {
         timeout: f64,
         #[pyarg(any, default = "0")]
         detect_types: c_int,
-        #[pyarg(any, default = "Some(vm.ctx.empty_str.clone())")]
+        #[pyarg(any, default = "Some(vm.ctx.empty_str.to_owned())")]
         isolation_level: Option<PyStrRef>,
         #[pyarg(any, default = "true")]
         check_same_thread: bool,
@@ -309,6 +314,13 @@ mod _sqlite {
         cached_statements: c_int,
         #[pyarg(any, default = "false")]
         uri: bool,
+    }
+
+    unsafe impl Traverse for ConnectArgs {
+        fn traverse(&self, tracer_fn: &mut TraverseFn) {
+            self.isolation_level.traverse(tracer_fn);
+            self.factory.traverse(tracer_fn);
+        }
     }
 
     #[derive(FromArgs)]
@@ -323,6 +335,13 @@ mod _sqlite {
         name: Option<PyStrRef>,
         #[pyarg(named, default = "0.250")]
         sleep: f64,
+    }
+
+    unsafe impl Traverse for BackupArgs {
+        fn traverse(&self, tracer_fn: &mut TraverseFn) {
+            self.progress.traverse(tracer_fn);
+            self.name.traverse(tracer_fn);
+        }
     }
 
     #[derive(FromArgs)]
@@ -439,7 +458,9 @@ mod _sqlite {
             let context = SqliteContext::from(context);
             let (_, vm) = (*context.user_data::<Self>()).retrieve();
             let instance = context.aggregate_context::<*const PyObject>();
-            let Some(instance) = (*instance).as_ref() else { return; };
+            let Some(instance) = (*instance).as_ref() else {
+                return;
+            };
 
             Self::callback_result_from_method(context, instance, "finalize", vm);
         }
@@ -465,9 +486,9 @@ mod _sqlite {
                 };
 
                 let val = match val?.as_bigint().sign() {
-                    num_bigint::Sign::Plus => 1,
-                    num_bigint::Sign::Minus => -1,
-                    num_bigint::Sign::NoSign => 0,
+                    Sign::Plus => 1,
+                    Sign::Minus => -1,
+                    Sign::NoSign => 0,
                 };
 
                 Ok(val)
@@ -879,7 +900,7 @@ mod _sqlite {
                 let cursor = cursor.downcast::<Cursor>().map_err(|x| {
                     vm.new_type_error(format!("factory must return a cursor, not {}", x.class()))
                 })?;
-                unsafe { cursor.row_factory.swap(zelf.row_factory.to_owned()) };
+                let _ = unsafe { cursor.row_factory.swap(zelf.row_factory.to_owned()) };
                 cursor
             } else {
                 let row_factory = zelf.row_factory.to_owned();
@@ -1061,7 +1082,17 @@ mod _sqlite {
             };
             let db = self.db_lock(vm)?;
             let Some(data) = CallbackData::new(args.func, vm) else {
-                return db.create_function(name.as_ptr(), args.narg, flags, null_mut(), None, None, None, None, vm);
+                return db.create_function(
+                    name.as_ptr(),
+                    args.narg,
+                    flags,
+                    null_mut(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    vm,
+                );
             };
 
             db.create_function(
@@ -1082,7 +1113,17 @@ mod _sqlite {
             let name = args.name.to_cstring(vm)?;
             let db = self.db_lock(vm)?;
             let Some(data) = CallbackData::new(args.aggregate_class, vm) else {
-                return db.create_function(name.as_ptr(), args.narg, SQLITE_UTF8, null_mut(), None, None, None, None, vm);
+                return db.create_function(
+                    name.as_ptr(),
+                    args.narg,
+                    SQLITE_UTF8,
+                    null_mut(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    vm,
+                );
             };
 
             db.create_function(
@@ -1107,13 +1148,24 @@ mod _sqlite {
         ) -> PyResult<()> {
             let name = name.to_cstring(vm)?;
             let db = self.db_lock(vm)?;
-            let Some(data )= CallbackData::new(callable, vm) else {
+            let Some(data) = CallbackData::new(callable.clone(), vm) else {
                 unsafe {
-                    sqlite3_create_collation_v2(db.db, name.as_ptr(), SQLITE_UTF8, null_mut(), None, None);
+                    sqlite3_create_collation_v2(
+                        db.db,
+                        name.as_ptr(),
+                        SQLITE_UTF8,
+                        null_mut(),
+                        None,
+                        None,
+                    );
                 }
                 return Ok(());
             };
             let data = Box::into_raw(Box::new(data));
+
+            if !callable.is_callable() {
+                return Err(vm.new_type_error("parameter must be callable".to_owned()));
+            }
 
             let ret = unsafe {
                 sqlite3_create_collation_v2(
@@ -1129,7 +1181,7 @@ mod _sqlite {
             // TODO: replace with Result.inspect_err when stable
             if let Err(exc) = db.check(ret, vm) {
                 // create_collation do not call destructor if error occur
-                unsafe { Box::from_raw(data) };
+                let _ = unsafe { Box::from_raw(data) };
                 Err(exc)
             } else {
                 Ok(())
@@ -1148,7 +1200,18 @@ mod _sqlite {
             let db = self.db_lock(vm)?;
             let Some(data) = CallbackData::new(aggregate_class, vm) else {
                 unsafe {
-                    sqlite3_create_window_function(db.db, name.as_ptr(), narg, SQLITE_UTF8, null_mut(), None, None, None, None, None)
+                    sqlite3_create_window_function(
+                        db.db,
+                        name.as_ptr(),
+                        narg,
+                        SQLITE_UTF8,
+                        null_mut(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
                 };
                 return Ok(());
             };
@@ -1194,10 +1257,8 @@ mod _sqlite {
         #[pymethod]
         fn set_trace_callback(&self, callable: PyObjectRef, vm: &VirtualMachine) -> PyResult<()> {
             let db = self.db_lock(vm)?;
-            let Some(data )= CallbackData::new(callable, vm) else {
-                unsafe {
-                    sqlite3_trace_v2(db.db, SQLITE_TRACE_STMT as u32, None, null_mut())
-                };
+            let Some(data) = CallbackData::new(callable, vm) else {
+                unsafe { sqlite3_trace_v2(db.db, SQLITE_TRACE_STMT as u32, None, null_mut()) };
                 return Ok(());
             };
 
@@ -1221,7 +1282,7 @@ mod _sqlite {
             vm: &VirtualMachine,
         ) -> PyResult<()> {
             let db = self.db_lock(vm)?;
-            let Some(data )= CallbackData::new(callable, vm) else {
+            let Some(data) = CallbackData::new(callable, vm) else {
                 unsafe { sqlite3_progress_handler(db.db, n, None, null_mut()) };
                 return Ok(());
             };
@@ -1290,7 +1351,7 @@ mod _sqlite {
             if let Some(val) = &val {
                 begin_statement_ptr_from_isolation_level(val, vm)?;
             }
-            unsafe { self.isolation_level.swap(val) };
+            let _ = unsafe { self.isolation_level.swap(val) };
             Ok(())
         }
 
@@ -1300,7 +1361,7 @@ mod _sqlite {
         }
         #[pygetset(setter)]
         fn set_text_factory(&self, val: PyObjectRef) {
-            unsafe { self.text_factory.swap(val) };
+            let _ = unsafe { self.text_factory.swap(val) };
         }
 
         #[pygetset]
@@ -1309,7 +1370,7 @@ mod _sqlite {
         }
         #[pygetset(setter)]
         fn set_row_factory(&self, val: Option<PyObjectRef>) {
-            unsafe { self.row_factory.swap(val) };
+            let _ = unsafe { self.row_factory.swap(val) };
         }
 
         fn check_thread(&self, vm: &VirtualMachine) -> PyResult<()> {
@@ -1336,25 +1397,29 @@ mod _sqlite {
     }
 
     #[pyattr]
-    #[pyclass(name)]
+    #[pyclass(name, traverse)]
     #[derive(Debug, PyPayload)]
     struct Cursor {
         connection: PyRef<Connection>,
+        #[pytraverse(skip)]
         arraysize: PyAtomic<c_int>,
+        #[pytraverse(skip)]
         row_factory: PyAtomicRef<Option<PyObject>>,
         inner: PyMutex<Option<CursorInner>>,
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Traverse)]
     struct CursorInner {
         description: Option<PyTupleRef>,
         row_cast_map: Vec<Option<PyObjectRef>>,
+        #[pytraverse(skip)]
         lastrowid: i64,
+        #[pytraverse(skip)]
         rowcount: i64,
         statement: Option<PyRef<Statement>>,
     }
 
-    #[pyclass(with(Constructor, IterNext), flags(BASETYPE))]
+    #[pyclass(with(Constructor, IterNext, Iterable), flags(BASETYPE))]
     impl Cursor {
         fn new(
             connection: PyRef<Connection>,
@@ -1685,7 +1750,7 @@ mod _sqlite {
         }
     }
 
-    impl IterNextIterable for Cursor {}
+    impl SelfIter for Cursor {}
     impl IterNext for Cursor {
         fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
             let mut inner = zelf.inner(vm)?;
@@ -1789,7 +1854,7 @@ mod _sqlite {
     }
 
     #[pyattr]
-    #[pyclass(name)]
+    #[pyclass(name, traverse)]
     #[derive(Debug, PyPayload)]
     struct Row {
         data: PyTupleRef,
@@ -1817,7 +1882,9 @@ mod _sqlite {
             } else if let Some(name) = needle.payload::<PyStr>() {
                 for (obj, i) in self.description.iter().zip(0..) {
                     let obj = &obj.payload::<PyTuple>().unwrap().as_slice()[0];
-                    let Some(obj) = obj.payload::<PyStr>() else { break; };
+                    let Some(obj) = obj.payload::<PyStr>() else {
+                        break;
+                    };
                     let a_iter = name.as_str().chars().flat_map(|x| x.to_uppercase());
                     let b_iter = obj.as_str().chars().flat_map(|x| x.to_uppercase());
 
@@ -1918,10 +1985,11 @@ mod _sqlite {
     }
 
     #[pyattr]
-    #[pyclass(name)]
+    #[pyclass(name, traverse)]
     #[derive(Debug, PyPayload)]
     struct Blob {
         connection: PyRef<Connection>,
+        #[pytraverse(skip)]
         inner: PyMutex<Option<BlobInner>>,
     }
 
@@ -2128,7 +2196,10 @@ mod _sqlite {
 
             if let Some(index) = needle.try_index_opt(vm) {
                 let Some(value) = value.payload::<PyInt>() else {
-                    return Err(vm.new_type_error(format!("'{}' object cannot be interpreted as an integer", value.class())));
+                    return Err(vm.new_type_error(format!(
+                        "'{}' object cannot be interpreted as an integer",
+                        value.class()
+                    )));
                 };
                 let value = value.try_to_primitive::<u8>(vm)?;
                 let blob_len = inner.blob.bytes();

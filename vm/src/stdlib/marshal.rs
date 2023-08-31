@@ -15,7 +15,7 @@ mod decl {
         protocol::PyBuffer,
         PyObjectRef, PyResult, TryFromObject, VirtualMachine,
     };
-    use num_bigint::BigInt;
+    use malachite_bigint::BigInt;
     use num_complex::Complex64;
     use num_traits::Zero;
     use rustpython_compiler_core::marshal;
@@ -149,7 +149,8 @@ mod decl {
             self.0.ctx.new_int(value).into()
         }
         fn make_tuple(&self, elements: impl Iterator<Item = Self::Value>) -> Self::Value {
-            self.0.ctx.new_tuple(elements.collect()).into()
+            let elements = elements.collect();
+            self.0.ctx.new_tuple(elements).into()
         }
         fn make_code(&self, code: CodeObject) -> Self::Value {
             self.0.ctx.new_code(code).into()
@@ -213,6 +214,9 @@ mod decl {
             }
             marshal::MarshalError::InvalidUtf8 => {
                 vm.new_value_error("invalid utf8 in marshalled string".to_owned())
+            }
+            marshal::MarshalError::InvalidLocation => {
+                vm.new_value_error("invalid location in marshalled object".to_owned())
             }
             marshal::MarshalError::BadType => {
                 vm.new_value_error("bad marshal data (unknown type code)".to_owned())

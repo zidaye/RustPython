@@ -16,8 +16,8 @@ mod _collections {
         sequence::{MutObjectSequenceOp, OptionalRangeArgs},
         sliceable::SequenceIndexOp,
         types::{
-            AsSequence, Comparable, Constructor, Initializer, IterNext, IterNextIterable, Iterable,
-            PyComparisonOp,
+            AsSequence, Comparable, Constructor, Initializer, IterNext, Iterable, PyComparisonOp,
+            Representable, SelfIter,
         },
         utils::collection_repr,
         AsObject, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
@@ -57,7 +57,14 @@ mod _collections {
 
     #[pyclass(
         flags(BASETYPE),
-        with(Constructor, Initializer, AsSequence, Comparable, Iterable)
+        with(
+            Constructor,
+            Initializer,
+            AsSequence,
+            Comparable,
+            Iterable,
+            Representable
+        )
     )]
     impl PyDeque {
         #[pymethod]
@@ -293,27 +300,6 @@ mod _collections {
             idx.wrapped_at(deque.len())
                 .and_then(|i| deque.remove(i).map(drop))
                 .ok_or_else(|| vm.new_index_error("deque index out of range".to_owned()))
-        }
-
-        #[pymethod(magic)]
-        fn repr(zelf: PyRef<Self>, vm: &VirtualMachine) -> PyResult<String> {
-            let deque = zelf.borrow_deque().clone();
-            let class = zelf.class();
-            let class_name = class.name();
-            let closing_part = zelf
-                .maxlen
-                .map(|maxlen| format!("], maxlen={maxlen}"))
-                .unwrap_or_else(|| "]".to_owned());
-
-            let s = if zelf.len() == 0 {
-                format!("{class_name}([{closing_part})")
-            } else if let Some(_guard) = ReprGuard::enter(vm, zelf.as_object()) {
-                collection_repr(Some(&class_name), "[", &closing_part, deque.iter(), vm)?
-            } else {
-                "[...]".to_owned()
-            };
-
-            Ok(s)
         }
 
         #[pymethod(magic)]
@@ -580,6 +566,29 @@ mod _collections {
         }
     }
 
+    impl Representable for PyDeque {
+        #[inline]
+        fn repr_str(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<String> {
+            let deque = zelf.borrow_deque().clone();
+            let class = zelf.class();
+            let class_name = class.name();
+            let closing_part = zelf
+                .maxlen
+                .map(|maxlen| format!("], maxlen={maxlen}"))
+                .unwrap_or_else(|| "]".to_owned());
+
+            let s = if zelf.len() == 0 {
+                format!("{class_name}([{closing_part})")
+            } else if let Some(_guard) = ReprGuard::enter(vm, zelf.as_object()) {
+                collection_repr(Some(&class_name), "[", &closing_part, deque.iter(), vm)?
+            } else {
+                "[...]".to_owned()
+            };
+
+            Ok(s)
+        }
+    }
+
     #[pyattr]
     #[pyclass(name = "_deque_iterator")]
     #[derive(Debug, PyPayload)]
@@ -614,7 +623,7 @@ mod _collections {
         }
     }
 
-    #[pyclass(with(IterNext, Constructor))]
+    #[pyclass(with(IterNext, Iterable, Constructor))]
     impl PyDequeIterator {
         pub(crate) fn new(deque: PyDequeRef) -> Self {
             PyDequeIterator {
@@ -645,7 +654,7 @@ mod _collections {
         }
     }
 
-    impl IterNextIterable for PyDequeIterator {}
+    impl SelfIter for PyDequeIterator {}
     impl IterNext for PyDequeIterator {
         fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
             zelf.internal.lock().next(|deque, pos| {
@@ -687,7 +696,7 @@ mod _collections {
         }
     }
 
-    #[pyclass(with(IterNext, Constructor))]
+    #[pyclass(with(IterNext, Iterable, Constructor))]
     impl PyReverseDequeIterator {
         #[pymethod(magic)]
         fn length_hint(&self) -> usize {
@@ -711,7 +720,7 @@ mod _collections {
         }
     }
 
-    impl IterNextIterable for PyReverseDequeIterator {}
+    impl SelfIter for PyReverseDequeIterator {}
     impl IterNext for PyReverseDequeIterator {
         fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
             zelf.internal.lock().next(|deque, pos| {

@@ -16,18 +16,19 @@ impl PyObject {
     }
 
     /// PyObject_Call*Arg* series
+    #[inline]
     pub fn call(&self, args: impl IntoFuncArgs, vm: &VirtualMachine) -> PyResult {
-        self.call_with_args(args.into_args(vm), vm)
+        let args = args.into_args(vm);
+        self.call_with_args(args, vm)
     }
 
     /// PyObject_Call
     pub fn call_with_args(&self, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
         vm_trace!("Invoke: {:?} {:?}", callable, args);
         let Some(callable) = self.to_callable() else {
-            return Err(vm.new_type_error(format!(
-                "'{}' object is not callable",
-                self.class().name()
-            )));
+            return Err(
+                vm.new_type_error(format!("'{}' object is not callable", self.class().name()))
+            );
         };
         callable.invoke(args, vm)
     }
@@ -45,8 +46,9 @@ impl<'a> PyCallable<'a> {
     }
 
     pub fn invoke(&self, args: impl IntoFuncArgs, vm: &VirtualMachine) -> PyResult {
+        let args = args.into_args(vm);
         vm.trace_event(TraceEvent::Call)?;
-        let result = (self.call)(self.obj, args.into_args(vm), vm);
+        let result = (self.call)(self.obj, args, vm);
         vm.trace_event(TraceEvent::Return)?;
         result
     }
@@ -100,14 +102,18 @@ impl VirtualMachine {
             self.use_tracing.set(false);
             let res = trace_func.call(args.clone(), self);
             self.use_tracing.set(true);
-            res?;
+            if res.is_err() {
+                *self.trace_func.borrow_mut() = self.ctx.none();
+            }
         }
 
         if !self.is_none(&profile_func) {
             self.use_tracing.set(false);
             let res = profile_func.call(args, self);
             self.use_tracing.set(true);
-            res?;
+            if res.is_err() {
+                *self.profile_func.borrow_mut() = self.ctx.none();
+            }
         }
         Ok(())
     }

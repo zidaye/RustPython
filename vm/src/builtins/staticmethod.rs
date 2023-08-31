@@ -1,14 +1,13 @@
-use super::{PyStr, PyStrInterned, PyType, PyTypeRef};
+use super::{PyStr, PyType, PyTypeRef};
 use crate::{
-    builtins::builtin_func::PyBuiltinMethod,
     class::PyClassImpl,
     common::lock::PyMutex,
-    function::{FuncArgs, IntoPyNativeFunc},
+    function::FuncArgs,
     types::{Callable, Constructor, GetDescriptor, Initializer, Representable},
     Context, Py, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
 };
 
-#[pyclass(module = false, name = "staticmethod")]
+#[pyclass(module = false, name = "staticmethod", traverse)]
 #[derive(Debug)]
 pub struct PyStaticMethod {
     pub callable: PyMutex<PyObjectRef>,
@@ -63,27 +62,6 @@ impl Constructor for PyStaticMethod {
 
 impl PyStaticMethod {
     pub fn new_ref(callable: PyObjectRef, ctx: &Context) -> PyRef<Self> {
-        PyRef::new_ref(
-            Self {
-                callable: PyMutex::new(callable),
-            },
-            ctx.types.staticmethod_type.to_owned(),
-            None,
-        )
-    }
-}
-
-impl PyStaticMethod {
-    pub fn new_builtin_ref<F, FKind>(
-        name: &'static PyStrInterned,
-        class: &'static Py<PyType>,
-        f: F,
-        ctx: &Context,
-    ) -> PyRef<Self>
-    where
-        F: IntoPyNativeFunc<FKind>,
-    {
-        let callable = PyBuiltinMethod::new_ref(name, class, f, ctx).into();
         PyRef::new_ref(
             Self {
                 callable: PyMutex::new(callable),

@@ -1,18 +1,154 @@
-use super::{PyStr, PyStrInterned, PyType, PyTypeRef};
+use super::{PyStr, PyStrInterned, PyType};
 use crate::{
+    builtins::{builtin_func::PyNativeMethod, type_},
     class::PyClassImpl,
-    function::PySetterValue,
-    types::{Constructor, GetDescriptor, Representable, Unconstructible},
-    AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyResult, VirtualMachine,
+    function::{FuncArgs, PyMethodDef, PyMethodFlags, PySetterValue},
+    types::{Callable, Constructor, GetDescriptor, Representable, Unconstructible},
+    AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, VirtualMachine,
 };
 use rustpython_common::lock::PyRwLock;
 
 #[derive(Debug)]
-pub struct DescrObject {
-    pub typ: PyTypeRef,
+pub struct PyDescriptor {
+    pub typ: &'static Py<PyType>,
     pub name: &'static PyStrInterned,
     pub qualname: PyRwLock<Option<String>>,
 }
+
+#[derive(Debug)]
+pub struct PyDescriptorOwned {
+    pub typ: PyRef<PyType>,
+    pub name: &'static PyStrInterned,
+    pub qualname: PyRwLock<Option<String>>,
+}
+
+#[pyclass(name = "method_descriptor", module = false)]
+pub struct PyMethodDescriptor {
+    pub common: PyDescriptor,
+    pub method: &'static PyMethodDef,
+    // vectorcall: vectorcallfunc,
+}
+
+impl PyMethodDescriptor {
+    pub fn new(method: &'static PyMethodDef, typ: &'static Py<PyType>, ctx: &Context) -> Self {
+        Self {
+            common: PyDescriptor {
+                typ,
+                name: ctx.intern_str(method.name),
+                qualname: PyRwLock::new(None),
+            },
+            method,
+        }
+    }
+}
+
+impl PyPayload for PyMethodDescriptor {
+    fn class(ctx: &Context) -> &'static Py<PyType> {
+        ctx.types.method_descriptor_type
+    }
+}
+
+impl std::fmt::Debug for PyMethodDescriptor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "method descriptor for '{}'", self.common.name)
+    }
+}
+
+impl GetDescriptor for PyMethodDescriptor {
+    fn descr_get(
+        zelf: PyObjectRef,
+        obj: Option<PyObjectRef>,
+        cls: Option<PyObjectRef>,
+        vm: &VirtualMachine,
+    ) -> PyResult {
+        let descr = Self::_as_pyref(&zelf, vm).unwrap();
+        let bound = match obj {
+            Some(obj) => {
+                if descr.method.flags.contains(PyMethodFlags::METHOD) {
+                    if cls.map_or(false, |c| c.fast_isinstance(vm.ctx.types.type_type)) {
+                        obj
+                    } else {
+                        return Err(vm.new_type_error(format!(
+                            "descriptor '{}' needs a type, not '{}', as arg 2",
+                            descr.common.name.as_str(),
+                            obj.class().name()
+                        )));
+                    }
+                } else if descr.method.flags.contains(PyMethodFlags::CLASS) {
+                    obj.class().to_owned().into()
+                } else {
+                    unimplemented!()
+                }
+            }
+            None if descr.method.flags.contains(PyMethodFlags::CLASS) => cls.unwrap(),
+            None => return Ok(zelf),
+        };
+        // Ok(descr.method.build_bound_method(&vm.ctx, bound, class).into())
+        Ok(descr.bind(bound, &vm.ctx).into())
+    }
+}
+
+impl Callable for PyMethodDescriptor {
+    type Args = FuncArgs;
+    #[inline]
+    fn call(zelf: &Py<Self>, args: FuncArgs, vm: &VirtualMachine) -> PyResult {
+        (zelf.method.func)(vm, args)
+    }
+}
+
+impl PyMethodDescriptor {
+    pub fn bind(&self, obj: PyObjectRef, ctx: &Context) -> PyRef<PyNativeMethod> {
+        self.method.build_bound_method(ctx, obj, self.common.typ)
+    }
+}
+
+#[pyclass(
+    with(GetDescriptor, Callable, Constructor, Representable),
+    flags(METHOD_DESCRIPTOR)
+)]
+impl PyMethodDescriptor {
+    #[pygetset(magic)]
+    fn name(&self) -> &'static PyStrInterned {
+        self.common.name
+    }
+    #[pygetset(magic)]
+    fn qualname(&self) -> String {
+        format!("{}.{}", self.common.typ.name(), &self.common.name)
+    }
+    #[pygetset(magic)]
+    fn doc(&self) -> Option<&'static str> {
+        self.method.doc
+    }
+    #[pygetset(magic)]
+    fn text_signature(&self) -> Option<String> {
+        self.method.doc.and_then(|doc| {
+            type_::get_text_signature_from_internal_doc(self.method.name, doc)
+                .map(|signature| signature.to_string())
+        })
+    }
+    #[pymethod(magic)]
+    fn reduce(
+        &self,
+        vm: &VirtualMachine,
+    ) -> (Option<PyObjectRef>, (Option<PyObjectRef>, &'static str)) {
+        let builtins_getattr = vm.builtins.get_attr("getattr", vm).ok();
+        let classname = vm.builtins.get_attr(&self.common.typ.__name__(vm), vm).ok();
+        (builtins_getattr, (classname, self.method.name))
+    }
+}
+
+impl Representable for PyMethodDescriptor {
+    #[inline]
+    fn repr_str(zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<String> {
+        Ok(format!(
+            "<method '{}' of '{}' objects>",
+            &zelf.method.name,
+            zelf.common.typ.name()
+        ))
+    }
+}
+
+impl Unconstructible for PyMethodDescriptor {}
 
 #[derive(Debug)]
 pub enum MemberKind {
@@ -32,7 +168,7 @@ pub enum MemberSetter {
     Offset(usize),
 }
 
-pub struct MemberDef {
+pub struct PyMemberDef {
     pub name: String,
     pub kind: MemberKind,
     pub getter: MemberGetter,
@@ -40,7 +176,7 @@ pub struct MemberDef {
     pub doc: Option<String>,
 }
 
-impl MemberDef {
+impl PyMemberDef {
     fn get(&self, obj: PyObjectRef, vm: &VirtualMachine) -> PyResult {
         match self.getter {
             MemberGetter::Getter(getter) => (getter)(vm, obj),
@@ -64,9 +200,9 @@ impl MemberDef {
     }
 }
 
-impl std::fmt::Debug for MemberDef {
+impl std::fmt::Debug for PyMemberDef {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MemberDef")
+        f.debug_struct("PyMemberDef")
             .field("name", &self.name)
             .field("kind", &self.kind)
             .field("doc", &self.doc)
@@ -74,21 +210,22 @@ impl std::fmt::Debug for MemberDef {
     }
 }
 
+// PyMemberDescrObject in CPython
 #[pyclass(name = "member_descriptor", module = false)]
 #[derive(Debug)]
-pub struct MemberDescrObject {
-    pub common: DescrObject,
-    pub member: MemberDef,
+pub struct PyMemberDescriptor {
+    pub common: PyDescriptorOwned,
+    pub member: PyMemberDef,
 }
 
-impl PyPayload for MemberDescrObject {
+impl PyPayload for PyMemberDescriptor {
     fn class(ctx: &Context) -> &'static Py<PyType> {
         ctx.types.member_descriptor_type
     }
 }
 
-fn calculate_qualname(descr: &DescrObject, vm: &VirtualMachine) -> PyResult<Option<String>> {
-    if let Some(qualname) = vm.get_attribute_opt(descr.typ.to_owned().into(), "__qualname__")? {
+fn calculate_qualname(descr: &PyDescriptorOwned, vm: &VirtualMachine) -> PyResult<Option<String>> {
+    if let Some(qualname) = vm.get_attribute_opt(descr.typ.clone().into(), "__qualname__")? {
         let str = qualname.downcast::<PyStr>().map_err(|_| {
             vm.new_type_error(
                 "<descriptor>.__objclass__.__qualname__ is not a unicode object".to_owned(),
@@ -101,7 +238,7 @@ fn calculate_qualname(descr: &DescrObject, vm: &VirtualMachine) -> PyResult<Opti
 }
 
 #[pyclass(with(GetDescriptor, Constructor, Representable), flags(BASETYPE))]
-impl MemberDescrObject {
+impl PyMemberDescriptor {
     #[pygetset(magic)]
     fn doc(&self) -> Option<String> {
         self.member.doc.to_owned()
@@ -136,7 +273,7 @@ impl MemberDescrObject {
 fn get_slot_from_object(
     obj: PyObjectRef,
     offset: usize,
-    member: &MemberDef,
+    member: &PyMemberDef,
     vm: &VirtualMachine,
 ) -> PyResult {
     let slot = match member.kind {
@@ -158,7 +295,7 @@ fn get_slot_from_object(
 fn set_slot_at_object(
     obj: PyObjectRef,
     offset: usize,
-    member: &MemberDef,
+    member: &PyMemberDef,
     value: PySetterValue,
     vm: &VirtualMachine,
 ) -> PyResult<()> {
@@ -186,9 +323,9 @@ fn set_slot_at_object(
     Ok(())
 }
 
-impl Unconstructible for MemberDescrObject {}
+impl Unconstructible for PyMemberDescriptor {}
 
-impl Representable for MemberDescrObject {
+impl Representable for PyMemberDescriptor {
     #[inline]
     fn repr_str(zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<String> {
         Ok(format!(
@@ -199,7 +336,7 @@ impl Representable for MemberDescrObject {
     }
 }
 
-impl GetDescriptor for MemberDescrObject {
+impl GetDescriptor for PyMemberDescriptor {
     fn descr_get(
         zelf: PyObjectRef,
         obj: Option<PyObjectRef>,
@@ -216,7 +353,7 @@ impl GetDescriptor for MemberDescrObject {
     }
 }
 
-pub fn init(context: &Context) {
-    let member_descriptor_type = &context.types.member_descriptor_type;
-    MemberDescrObject::extend_class(context, member_descriptor_type);
+pub fn init(ctx: &Context) {
+    PyMemberDescriptor::extend_class(ctx, ctx.types.member_descriptor_type);
+    PyMethodDescriptor::extend_class(ctx, ctx.types.method_descriptor_type);
 }

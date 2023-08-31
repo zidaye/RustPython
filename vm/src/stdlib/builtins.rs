@@ -1,7 +1,9 @@
 //! Builtin function definitions.
 //!
 //! Implements the list of [builtin Python functions](https://docs.python.org/3/library/builtins.html).
-use crate::{class::PyClassImpl, PyObjectRef, VirtualMachine};
+use crate::{builtins::PyModule, class::PyClassImpl, Py, VirtualMachine};
+pub(crate) use builtins::{__module_def, DOC};
+pub use builtins::{ascii, print, reversed};
 
 #[pymodule]
 mod builtins {
@@ -19,15 +21,15 @@ mod builtins {
         convert::ToPyException,
         function::{
             ArgBytesLike, ArgCallable, ArgIndex, ArgIntoBool, ArgIterable, ArgMapping,
-            ArgStrOrBytesLike, Either, FuncArgs, KwArgs, OptionalArg, OptionalOption, PosArgs,
-            PyArithmeticValue,
+            ArgStrOrBytesLike, Either, FsPath, FuncArgs, KwArgs, OptionalArg, OptionalOption,
+            PosArgs,
         },
-        protocol::{PyIter, PyIterReturn, PyNumberBinaryOp},
+        protocol::{PyIter, PyIterReturn},
         py_io,
         readline::{Readline, ReadlineResult},
         stdlib::sys,
         types::PyComparisonOp,
-        AsObject, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject, VirtualMachine,
+        AsObject, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject, VirtualMachine,
     };
     use num_traits::{Signed, ToPrimitive};
 
@@ -96,7 +98,7 @@ mod builtins {
     #[allow(dead_code)]
     struct CompileArgs {
         source: PyObjectRef,
-        filename: PyStrRef,
+        filename: FsPath,
         mode: PyStrRef,
         #[pyarg(any, optional)]
         flags: OptionalArg<PyIntRef>,
@@ -123,7 +125,7 @@ mod builtins {
 
             if args
                 .source
-                .fast_isinstance(&ast::AstNode::make_class(&vm.ctx))
+                .fast_isinstance(&ast::NodeAst::make_class(&vm.ctx))
             {
                 #[cfg(not(feature = "rustpython-codegen"))]
                 {
@@ -172,14 +174,14 @@ mod builtins {
                             .map_err(|err| vm.new_value_error(err.to_string()))?;
                         let code = vm
                             .compile(source, mode, args.filename.as_str().to_owned())
-                            .map_err(|err| err.to_pyexception(vm))?;
+                            .map_err(|err| (err, Some(source)).to_pyexception(vm))?;
                         Ok(code.into())
                     }
                 } else {
                     let mode = mode_str
                         .parse::<parser::Mode>()
                         .map_err(|err| vm.new_value_error(err.to_string()))?;
-                    ast::parse(vm, source, mode).map_err(|e| e.to_pyexception(vm))
+                    ast::parse(vm, source, mode).map_err(|e| (e, Some(source)).to_pyexception(vm))
                 }
             }
         }
@@ -255,7 +257,8 @@ mod builtins {
             Either::A(either) => {
                 let source: &[u8] = &either.borrow_bytes();
                 if source.contains(&0) {
-                    return Err(vm.new_value_error(
+                    return Err(vm.new_exception_msg(
+                        vm.ctx.exceptions.syntax_error.to_owned(),
                         "source code string cannot contain null bytes".to_owned(),
                     ));
                 }
@@ -299,7 +302,7 @@ mod builtins {
             #[cfg(feature = "rustpython-compiler")]
             Either::A(string) => vm
                 .compile(string.as_str(), mode, "<string>".to_owned())
-                .map_err(|err| vm.new_syntax_error(&err))?,
+                .map_err(|err| vm.new_syntax_error(&err, Some(string.as_str())))?,
             #[cfg(not(feature = "rustpython-compiler"))]
             Either::A(_) => return Err(vm.new_type_error(CODEGEN_NOT_SUPPORTED.to_owned())),
             Either::B(code_obj) => code_obj,
@@ -622,39 +625,8 @@ mod builtins {
             exp: y,
             modulus,
         } = args;
-        match modulus {
-            None => vm.binary_op(&x, &y, PyNumberBinaryOp::Power, "pow"),
-            Some(z) => {
-                let try_pow_value = |obj: &PyObject,
-                                     args: (PyObjectRef, PyObjectRef, PyObjectRef)|
-                 -> Option<PyResult> {
-                    let method = obj.get_class_attr(identifier!(vm, __pow__))?;
-                    let result = match method.call(args, vm) {
-                        Ok(x) => x,
-                        Err(e) => return Some(Err(e)),
-                    };
-                    Some(Ok(PyArithmeticValue::from_object(vm, result).into_option()?))
-                };
-
-                if let Some(val) = try_pow_value(&x, (x.clone(), y.clone(), z.clone())) {
-                    return val;
-                }
-
-                if !x.class().is(y.class()) {
-                    if let Some(val) = try_pow_value(&y, (x.clone(), y.clone(), z.clone())) {
-                        return val;
-                    }
-                }
-
-                if !x.class().is(z.class()) && !y.class().is(z.class()) {
-                    if let Some(val) = try_pow_value(&z, (x.clone(), y.clone(), z.clone())) {
-                        return val;
-                    }
-                }
-
-                Err(vm.new_unsupported_ternop_error(&x, &y, &z, "pow"))
-            }
-        }
+        let modulus = modulus.as_ref().map_or(vm.ctx.none.as_object(), |m| m);
+        vm._pow(&x, &y, modulus)
     }
 
     #[pyfunction]
@@ -716,7 +688,7 @@ mod builtins {
     }
 
     #[pyfunction]
-    fn reversed(obj: PyObjectRef, vm: &VirtualMachine) -> PyResult {
+    pub fn reversed(obj: PyObjectRef, vm: &VirtualMachine) -> PyResult {
         if let Some(reversed_method) = vm.get_method(obj.clone(), identifier!(vm, __reversed__)) {
             reversed_method?.call((), vm)
         } else {
@@ -965,14 +937,12 @@ mod builtins {
     }
 }
 
-pub use builtins::{ascii, print};
-
-pub fn make_module(vm: &VirtualMachine, module: PyObjectRef) {
+pub fn init_module(vm: &VirtualMachine, module: &Py<PyModule>) {
     let ctx = &vm.ctx;
 
     crate::protocol::VecBuffer::make_class(&vm.ctx);
 
-    builtins::extend_module(vm, &module);
+    builtins::extend_module(vm, module).unwrap();
 
     let debug_mode: bool = vm.state.settings.optimize == 0;
     extend_module!(vm, module, {

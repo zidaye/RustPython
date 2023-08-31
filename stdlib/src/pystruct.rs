@@ -15,11 +15,12 @@ pub(crate) mod _struct {
         function::{ArgBytesLike, ArgMemoryBuffer, PosArgs},
         match_class,
         protocol::PyIterReturn,
-        types::{Constructor, IterNext, IterNextIterable},
+        types::{Constructor, IterNext, Iterable, SelfIter},
         AsObject, Py, PyObjectRef, PyPayload, PyResult, TryFromObject, VirtualMachine,
     };
     use crossbeam_utils::atomic::AtomicCell;
 
+    #[derive(Traverse)]
     struct IntoStructFormatBytes(PyStrRef);
 
     impl TryFromObject for IntoStructFormatBytes {
@@ -154,11 +155,13 @@ pub(crate) mod _struct {
     }
 
     #[pyattr]
-    #[pyclass(name = "unpack_iterator")]
+    #[pyclass(name = "unpack_iterator", traverse)]
     #[derive(Debug, PyPayload)]
     struct UnpackIterator {
+        #[pytraverse(skip)]
         format_spec: FormatSpec,
         buffer: ArgBytesLike,
+        #[pytraverse(skip)]
         offset: AtomicCell<usize>,
     }
 
@@ -191,14 +194,14 @@ pub(crate) mod _struct {
         }
     }
 
-    #[pyclass(with(IterNext))]
+    #[pyclass(with(IterNext, Iterable))]
     impl UnpackIterator {
         #[pymethod(magic)]
         fn length_hint(&self) -> usize {
             self.buffer.len().saturating_sub(self.offset.load()) / self.format_spec.size
         }
     }
-    impl IterNextIterable for UnpackIterator {}
+    impl SelfIter for UnpackIterator {}
     impl IterNext for UnpackIterator {
         fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
             let size = zelf.format_spec.size;
@@ -231,9 +234,10 @@ pub(crate) mod _struct {
     }
 
     #[pyattr]
-    #[pyclass(name = "Struct")]
+    #[pyclass(name = "Struct", traverse)]
     #[derive(Debug, PyPayload)]
     struct PyStruct {
+        #[pytraverse(skip)]
         spec: FormatSpec,
         format: PyStrRef,
     }

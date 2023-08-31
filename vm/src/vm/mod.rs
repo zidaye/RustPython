@@ -22,12 +22,11 @@ use crate::{
         PyBaseExceptionRef, PyDictRef, PyInt, PyList, PyModule, PyStr, PyStrInterned, PyStrRef,
         PyTypeRef,
     },
-    bytecode::frozen_lib::FrozenModule,
     codecs::CodecsRegistry,
     common::{hash::HashSecret, lock::PyMutex, rc::PyRc},
     convert::ToPyObject,
     frame::{ExecutionResult, Frame, FrameRef},
-    frozen,
+    frozen::FrozenModule,
     function::{ArgMapping, FuncArgs, PySetterValue},
     import,
     protocol::PyIterIter,
@@ -98,6 +97,10 @@ pub struct PyGlobalState {
     pub finalizing: AtomicBool,
     pub warnings: WarningsState,
     pub override_frozen_modules: AtomicCell<isize>,
+    pub before_forkers: PyMutex<Vec<PyObjectRef>>,
+    pub after_forkers_child: PyMutex<Vec<PyObjectRef>>,
+    pub after_forkers_parent: PyMutex<Vec<PyObjectRef>>,
+    pub int_max_str_digits: AtomicCell<usize>,
 }
 
 pub fn process_hash_secret_seed() -> u32 {
@@ -113,17 +116,17 @@ impl VirtualMachine {
 
         // make a new module without access to the vm; doesn't
         // set __spec__, __loader__, etc. attributes
-        let new_module = || {
+        let new_module = |def| {
             PyRef::new_ref(
-                PyModule {},
+                PyModule::from_def(def),
                 ctx.types.module_type.to_owned(),
                 Some(ctx.new_dict()),
             )
         };
 
         // Hard-core modules:
-        let builtins = new_module();
-        let sys_module = new_module();
+        let builtins = new_module(stdlib::builtins::__module_def(&ctx));
+        let sys_module = new_module(stdlib::sys::__module_def(&ctx));
 
         let import_func = ctx.none();
         let profile_func = RefCell::new(ctx.none());
@@ -148,6 +151,10 @@ impl VirtualMachine {
 
         let warnings = WarningsState::init_state(&ctx);
 
+        let int_max_str_digits = AtomicCell::new(match settings.int_max_str_digits {
+            -1 => 4300,
+            other => other,
+        } as usize);
         let mut vm = VirtualMachine {
             builtins,
             sys_module,
@@ -175,6 +182,10 @@ impl VirtualMachine {
                 finalizing: AtomicBool::new(false),
                 warnings,
                 override_frozen_modules: AtomicCell::new(0),
+                before_forkers: PyMutex::default(),
+                after_forkers_child: PyMutex::default(),
+                after_forkers_parent: PyMutex::default(),
+                int_max_str_digits,
             }),
             initialized: false,
             recursion_depth: Cell::new(0),
@@ -190,14 +201,20 @@ impl VirtualMachine {
             panic!("Interpreters in same process must share the hash seed");
         }
 
-        let frozen = frozen::core_frozen_inits().collect();
+        let frozen = core_frozen_inits().collect();
         PyRc::get_mut(&mut vm.state).unwrap().frozen = frozen;
 
-        vm.builtins
-            .init_module_dict(vm.ctx.intern_str("builtins"), vm.ctx.none(), &vm);
-        vm.sys_module
-            .init_module_dict(vm.ctx.intern_str("sys"), vm.ctx.none(), &vm);
-
+        vm.builtins.init_dict(
+            vm.ctx.intern_str("builtins"),
+            Some(vm.ctx.intern_str(stdlib::builtins::DOC.unwrap()).to_owned()),
+            &vm,
+        );
+        vm.sys_module.init_dict(
+            vm.ctx.intern_str("sys"),
+            Some(vm.ctx.intern_str(stdlib::sys::DOC.unwrap()).to_owned()),
+            &vm,
+        );
+        // let name = vm.sys_module.get_attr("__name__", &vm).unwrap();
         vm
     }
 
@@ -206,12 +223,31 @@ impl VirtualMachine {
     #[cfg(feature = "encodings")]
     fn import_encodings(&mut self) -> PyResult<()> {
         self.import("encodings", None, 0).map_err(|import_err| {
-            let err = self.new_runtime_error(
-                "Could not import encodings. Is your RUSTPYTHONPATH set? If you don't have \
-                    access to a consistent external environment (e.g. if you're embedding \
-                    rustpython in another application), try enabling the freeze-stdlib feature"
-                    .to_owned(),
+            let rustpythonpath_env = std::env::var("RUSTPYTHONPATH").ok();
+            let pythonpath_env = std::env::var("PYTHONPATH").ok();
+            let env_set = rustpythonpath_env.as_ref().is_some() || pythonpath_env.as_ref().is_some();
+            let path_contains_env = self.state.settings.path_list.iter().any(|s| {
+                Some(s.as_str()) == rustpythonpath_env.as_deref() || Some(s.as_str()) == pythonpath_env.as_deref()
+            });
+
+            let guide_message = if !env_set {
+                "Neither RUSTPYTHONPATH nor PYTHONPATH is set. Try setting one of them to the stdlib directory."
+            } else if path_contains_env {
+                "RUSTPYTHONPATH or PYTHONPATH is set, but it doesn't contain the encodings library. If you are customizing the RustPython vm/interpreter, try adding the stdlib directory to the path. If you are developing the RustPython interpreter, it might be a bug during development."
+            } else {
+                "RUSTPYTHONPATH or PYTHONPATH is set, but it wasn't loaded to `Settings::path_list`. If you are going to customize the RustPython vm/interpreter, those environment variables are not loaded in the Settings struct by default. Please try creating a customized instance of the Settings struct. If you are developing the RustPython interpreter, it might be a bug during development."
+            };
+
+            let msg = format!(
+                "RustPython could not import the encodings module. It usually means something went wrong. Please carefully read the following messages and follow the steps.\n\
+                \n\
+                {guide_message}\n\
+                If you don't have access to a consistent external environment (e.g. targeting wasm, embedding \
+                    rustpython in another application), try enabling the `freeze-stdlib` feature.\n\
+                If this is intended and you want to exclude the encodings module from your interpreter, please remove the `encodings` feature from `rustpython-vm` crate."
             );
+
+            let err = self.new_runtime_error(msg);
             err.set_cause(Some(import_err));
             err
         })?;
@@ -220,11 +256,13 @@ impl VirtualMachine {
 
     fn import_utf8_encodings(&mut self) -> PyResult<()> {
         import::import_frozen(self, "codecs")?;
-        let encoding_module_name = if cfg!(feature = "freeze-stdlib") {
-            "encodings.utf_8"
-        } else {
-            "encodings_utf_8"
-        };
+        // FIXME: See corresponding part of `core_frozen_inits`
+        // let encoding_module_name = if cfg!(feature = "freeze-stdlib") {
+        //     "encodings.utf_8"
+        // } else {
+        //     "encodings_utf_8"
+        // };
+        let encoding_module_name = "encodings_utf_8";
         let encoding_module = import::import_frozen(self, encoding_module_name)?;
         let getregentry = encoding_module.get_attr("getregentry", self)?;
         let codec_info = getregentry.call((), self)?;
@@ -241,11 +279,8 @@ impl VirtualMachine {
             panic!("Double Initialize Error");
         }
 
-        // add the current directory to sys.path
-        self.state_mut().settings.path_list.insert(0, "".to_owned());
-
-        stdlib::builtins::make_module(self, self.builtins.clone().into());
-        stdlib::sys::init_module(self, self.sys_module.as_ref(), self.builtins.as_ref());
+        stdlib::builtins::init_module(self, &self.builtins);
+        stdlib::sys::init_module(self, &self.sys_module, &self.builtins);
 
         let mut essential_init = || -> PyResult {
             #[cfg(not(target_arch = "wasm32"))]
@@ -301,9 +336,21 @@ impl VirtualMachine {
         }
 
         #[cfg(feature = "encodings")]
-        if let Err(e) = self.import_encodings() {
-            eprintln!("encodings initialization failed. Only utf-8 encoding will be supported.");
-            self.print_exception(e);
+        if cfg!(feature = "freeze-stdlib") || !self.state.settings.path_list.is_empty() {
+            if let Err(e) = self.import_encodings() {
+                eprintln!(
+                    "encodings initialization failed. Only utf-8 encoding will be supported."
+                );
+                self.print_exception(e);
+            }
+        } else {
+            // Here may not be the best place to give general `path_list` advice,
+            // but bare rustpython_vm::VirtualMachine users skipped proper settings must hit here while properly setup vm never enters here.
+            eprintln!(
+                "feature `encodings` is enabled but `settings.path_list` is empty. \
+                Please add the library path to `settings.path_list`. If you intended to disable the entire standard library (including the `encodings` feature), please also make sure to disable the `encodings` feature.\n\
+                Tip: You may also want to add `\"\"` to `settings.path_list` in order to enable importing from the current working directory."
+            );
         }
 
         self.initialized = true;
@@ -469,11 +516,12 @@ impl VirtualMachine {
     #[inline]
     pub fn import<'a>(
         &self,
-        module: impl AsPyStr<'a>,
+        module_name: impl AsPyStr<'a>,
         from_list: Option<PyTupleTyped<PyStrRef>>,
         level: usize,
     ) -> PyResult {
-        self.import_inner(module.as_pystr(&self.ctx), from_list, level)
+        let module_name = module_name.as_pystr(&self.ctx);
+        self.import_inner(module_name, from_list, level)
     }
 
     fn import_inner(
@@ -794,16 +842,14 @@ impl VirtualMachine {
     #[doc(hidden)]
     pub fn __module_set_attr(
         &self,
-        module: &PyObject,
-        attr_name: &str,
+        module: &Py<PyModule>,
+        attr_name: &'static PyStrInterned,
         attr_value: impl Into<PyObjectRef>,
     ) -> PyResult<()> {
         let val = attr_value.into();
-        module.generic_setattr(
-            self.ctx.intern_str(attr_name),
-            PySetterValue::Assign(val),
-            self,
-        )
+        module
+            .as_object()
+            .generic_setattr(attr_name, PySetterValue::Assign(val), self)
     }
 
     pub fn insert_sys_path(&self, obj: PyObjectRef) -> PyResult<()> {
@@ -826,6 +872,44 @@ impl AsRef<Context> for VirtualMachine {
     }
 }
 
+fn core_frozen_inits() -> impl Iterator<Item = (&'static str, FrozenModule)> {
+    let iter = std::iter::empty();
+    macro_rules! ext_modules {
+        ($iter:ident, $($t:tt)*) => {
+            let $iter = $iter.chain(py_freeze!($($t)*));
+        };
+    }
+
+    // keep as example but use file one now
+    // ext_modules!(
+    //     iter,
+    //     source = "initialized = True; print(\"Hello world!\")\n",
+    //     module_name = "__hello__",
+    // );
+
+    // Python modules that the vm calls into, but are not actually part of the stdlib. They could
+    // in theory be implemented in Rust, but are easiest to do in Python for one reason or another.
+    // Includes _importlib_bootstrap and _importlib_bootstrap_external
+    ext_modules!(
+        iter,
+        dir = "./Lib/python_builtins",
+        crate_name = "rustpython_compiler_core"
+    );
+
+    // core stdlib Python modules that the vm calls into, but are still used in Python
+    // application code, e.g. copyreg
+    // FIXME: Initializing core_modules here results duplicated frozen module generation for core_modules.
+    // We need a way to initialize this modules for both `Interpreter::without_stdlib()` and `InterpreterConfig::new().init_stdlib().interpreter()`
+    // #[cfg(not(feature = "freeze-stdlib"))]
+    ext_modules!(
+        iter,
+        dir = "./Lib/core_modules",
+        crate_name = "rustpython_compiler_core"
+    );
+
+    iter
+}
+
 #[test]
 fn test_nested_frozen() {
     use rustpython_vm as vm;
@@ -837,13 +921,10 @@ fn test_nested_frozen() {
     .enter(|vm| {
         let scope = vm.new_scope_with_builtins();
 
+        let source = "from dir_module.dir_module_inner import value2";
         let code_obj = vm
-            .compile(
-                "from dir_module.dir_module_inner import value2",
-                vm::compiler::Mode::Exec,
-                "<embedded>".to_owned(),
-            )
-            .map_err(|err| vm.new_syntax_error(&err))
+            .compile(source, vm::compiler::Mode::Exec, "<embedded>".to_owned())
+            .map_err(|err| vm.new_syntax_error(&err, Some(source)))
             .unwrap();
 
         if let Err(e) = vm.run_code_obj(code_obj, scope) {

@@ -8,14 +8,14 @@ use crate::{
     function::{ArgIndex, FuncArgs, OptionalArg, PyComparisonValue},
     protocol::{PyIterReturn, PyMappingMethods, PySequenceMethods},
     types::{
-        AsMapping, AsSequence, Comparable, Constructor, Hashable, IterNext, IterNextIterable,
-        Iterable, PyComparisonOp, Representable, Unconstructible,
+        AsMapping, AsSequence, Comparable, Constructor, Hashable, IterNext, Iterable,
+        PyComparisonOp, Representable, SelfIter, Unconstructible,
     },
     AsObject, Context, Py, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject,
     VirtualMachine,
 };
 use crossbeam_utils::atomic::AtomicCell;
-use num_bigint::{BigInt, Sign};
+use malachite_bigint::{BigInt, Sign};
 use num_integer::Integer;
 use num_traits::{One, Signed, ToPrimitive, Zero};
 use once_cell::sync::Lazy;
@@ -287,7 +287,7 @@ impl PyRange {
 
     #[pymethod(magic)]
     fn reduce(&self, vm: &VirtualMachine) -> (PyTypeRef, PyTupleRef) {
-        let range_parameters: Vec<PyObjectRef> = vec![&self.start, &self.stop, &self.step]
+        let range_parameters: Vec<PyObjectRef> = [&self.start, &self.stop, &self.step]
             .iter()
             .map(|x| x.as_object().to_owned())
             .collect();
@@ -537,7 +537,7 @@ impl PyPayload for PyLongRangeIterator {
     }
 }
 
-#[pyclass(with(Constructor, IterNext))]
+#[pyclass(with(Constructor, IterNext, Iterable))]
 impl PyLongRangeIterator {
     #[pymethod(magic)]
     fn length_hint(&self) -> BigInt {
@@ -568,7 +568,7 @@ impl PyLongRangeIterator {
 }
 impl Unconstructible for PyLongRangeIterator {}
 
-impl IterNextIterable for PyLongRangeIterator {}
+impl SelfIter for PyLongRangeIterator {}
 impl IterNext for PyLongRangeIterator {
     fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         // TODO: In pathological case (index == usize::MAX) this can wrap around
@@ -602,7 +602,7 @@ impl PyPayload for PyRangeIterator {
     }
 }
 
-#[pyclass(with(Constructor, IterNext))]
+#[pyclass(with(Constructor, IterNext, Iterable))]
 impl PyRangeIterator {
     #[pymethod(magic)]
     fn length_hint(&self) -> usize {
@@ -634,7 +634,7 @@ impl PyRangeIterator {
 }
 impl Unconstructible for PyRangeIterator {}
 
-impl IterNextIterable for PyRangeIterator {}
+impl SelfIter for PyRangeIterator {}
 impl IterNext for PyRangeIterator {
     fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
         // TODO: In pathological case (index == usize::MAX) this can wrap around

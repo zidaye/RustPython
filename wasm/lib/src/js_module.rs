@@ -14,7 +14,7 @@ mod _js {
         convert::{IntoObject, ToPyObject},
         function::{ArgCallable, OptionalArg, OptionalOption, PosArgs},
         protocol::PyIterReturn,
-        types::{IterNext, IterNextIterable},
+        types::{IterNext, Representable, SelfIter},
         Py, PyObjectRef, PyPayload, PyRef, PyResult, TryFromObject, VirtualMachine,
     };
     use std::{cell, fmt, future};
@@ -90,13 +90,12 @@ mod _js {
         }
     }
 
-    #[pyclass]
+    #[pyclass(with(Representable))]
     impl PyJsValue {
         #[inline]
         pub fn new(value: impl Into<JsValue>) -> PyJsValue {
-            PyJsValue {
-                value: value.into(),
-            }
+            let value = value.into();
+            PyJsValue { value }
         }
 
         #[pymethod]
@@ -265,10 +264,12 @@ mod _js {
         fn instanceof(&self, rhs: PyJsValueRef, vm: &VirtualMachine) -> PyResult<bool> {
             instance_of(&self.value, &rhs.value).map_err(|err| new_js_error(vm, err))
         }
+    }
 
-        #[pymethod(magic)]
-        fn repr(&self) -> String {
-            format!("{:?}", self.value)
+    impl Representable for PyJsValue {
+        #[inline]
+        fn repr_str(zelf: &Py<Self>, _vm: &VirtualMachine) -> PyResult<String> {
+            Ok(format!("{:?}", zelf.value))
         }
     }
 
@@ -422,8 +423,8 @@ mod _js {
                     };
                     let _ = then.call(
                         (
-                            vm.ctx.new_function("resolve", resolve),
-                            vm.ctx.new_function("reject", reject),
+                            vm.new_function("resolve", resolve),
+                            vm.new_function("reject", reject),
                         ),
                         vm,
                     );
@@ -601,7 +602,7 @@ mod _js {
         }
     }
 
-    impl IterNextIterable for AwaitPromise {}
+    impl SelfIter for AwaitPromise {}
     impl IterNext for AwaitPromise {
         fn next(zelf: &Py<Self>, vm: &VirtualMachine) -> PyResult<PyIterReturn> {
             zelf.send(None, vm)
